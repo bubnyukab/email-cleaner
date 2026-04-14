@@ -1,1 +1,43 @@
+# =========================
+# Node / Next.js
+# =========================
+node_modules/
+.next/
+out/
+dist/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env files (IMPORTANT)
+.env
+.env.local
+.env.*.local
+
+# =========================
+# Go
+# =========================
+bin/
+*.exe
+*.out
+*.test
+
+# Go workspace file (optional)
+go.work
+
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Docker (optional)
+# =========================
+docker-data/
+
 *.json
