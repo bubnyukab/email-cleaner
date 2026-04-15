@@ -15,8 +15,13 @@ services:
       - "3000:3000"
     volumes:
       - ./frontend:/app
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/postgres?sslmode=disable"
+      BACKEND_URL: "http://backend:8080"
+      NEXT_PUBLIC_BACKEND_URL: "http://localhost:8080"
     depends_on:
       - backend
+      - db
 
   backend:
     build: ./backend
@@ -24,8 +29,29 @@ services:
       - "8080:8080"
     volumes:
       - ./backend:/app
-      
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/postgres?sslmode=disable"
+      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
+      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
+      GOOGLE_REDIRECT_URL: "${GOOGLE_REDIRECT_URL:-http://localhost:8080/api/go/auth/google/callback}"
+    depends_on:
+      - db
 
+  db:
+    container_name: db
+    image: postgres:18
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/
+
+volumes:
+  pgdata: {}
 # The commented out section below is an example of how to define a PostgreSQL
 # database that your application can use. `depends_on` tells Docker Compose to
 # start the database before your application. The `db-data` volume persists the
