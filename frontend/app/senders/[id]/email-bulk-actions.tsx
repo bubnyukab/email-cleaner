@@ -1,8 +1,9 @@
 'use client';
 
-import { bulkTrashEmails, type SenderEmail } from '@/lib/go/client';
+import { bulkTrashEmails, bulkUntrashEmails, type SenderEmail } from '@/lib/go/client';
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 
 export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmail[] }) {
   const router = useRouter();
@@ -28,13 +29,10 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
 
   const [pendingOp, setPendingOp] = useState<'trash' | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // When the table data changes (after a refresh), clear any old selection.
     setSelected(new Set());
     setPendingOp(null);
-    setError(null);
   }, [allGmailIds.join('|')]);
 
   const selectedCount = selected.size;
@@ -59,12 +57,29 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
   const onTrashSelected = async () => {
     if (selectedCount === 0) return;
     setPendingOp('trash');
-    setError(null);
+    const trashedIds = Array.from(selected);
     try {
-      await bulkTrashEmails(Array.from(selected));
+      const result = await bulkTrashEmails(trashedIds);
+      setSelected(new Set());
       router.refresh();
+
+      toast.success(`Moved ${result.processed} emails to trash`, {
+        action: {
+          label: 'Undo',
+          onClick: async () => {
+            try {
+              await bulkUntrashEmails(trashedIds);
+              toast.success('Restored emails from trash');
+              router.refresh();
+            } catch {
+              toast.error('Failed to undo trash');
+            }
+          },
+        },
+        duration: 10000,
+      });
     } catch (e) {
-      setError(
+      toast.error(
         e instanceof Error ? e.message : 'Failed to move selected emails to Trash',
       );
     } finally {
@@ -80,9 +95,9 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search subject, snippet, or email body"
-          className="w-full max-w-md rounded-md border border-gray-300 px-3 py-2 text-sm outline-none ring-0 placeholder:text-gray-400 focus:border-gray-500"
+          className="w-full max-w-md rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-0 placeholder:text-muted-foreground focus:border-ring"
         />
-        <span className="text-sm text-gray-500">
+        <span className="text-sm text-muted-foreground">
           Showing {filteredEmails.length} of {emails.length} emails
         </span>
       </div>
@@ -96,12 +111,11 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
         >
           {pendingOp === 'trash' ? 'Moving...' : `Move to Trash (${selectedCount})`}
         </button>
-        {error && <span className="text-sm text-red-600">{error}</span>}
       </div>
 
-      <div className="overflow-hidden rounded-lg border border-gray-200">
+      <div className="overflow-hidden rounded-lg border border-border">
         <table className="w-full text-left text-sm">
-          <thead className="bg-gray-50">
+          <thead className="bg-muted">
             <tr>
               <th className="w-12 px-4 py-3 font-medium">
                 <input
@@ -119,7 +133,7 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
           </thead>
           <tbody>
             {filteredEmails.map((email) => (
-              <tr key={email.id} className="border-t border-gray-100 align-top">
+              <tr key={email.id} className="border-t border-border align-top">
                 <td className="px-4 py-3">
                   <input
                     type="checkbox"
@@ -130,17 +144,17 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
                   />
                 </td>
                 <td className="px-4 py-3 font-medium">{email.subject || '(No subject)'}</td>
-                <td className="max-w-2xl px-4 py-3 text-gray-600">
+                <td className="max-w-2xl px-4 py-3 text-muted-foreground">
                   <div className="line-clamp-3">{email.snippet || email.bodyText}</div>
                 </td>
-                <td className="px-4 py-3 whitespace-nowrap text-gray-600">
+                <td className="px-4 py-3 whitespace-nowrap text-muted-foreground">
                   {email.receivedAt ? new Date(email.receivedAt).toLocaleString() : '-'}
                 </td>
               </tr>
             ))}
             {filteredEmails.length === 0 && (
               <tr>
-                <td colSpan={4} className="px-4 py-6 text-center text-gray-500">
+                <td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">
                   {emails.length === 0
                     ? 'No emails for this sender yet.'
                     : 'No emails match your search.'}
@@ -153,4 +167,3 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
     </div>
   );
 }
-

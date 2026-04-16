@@ -2,16 +2,19 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 
 type SyncStatus = {
   running: boolean;
-  scanned: number; // processed uncached messages (new work)
-  checked?: number; // ids evaluated (cached + uncached)
-  pendingTotal?: number; // uncached message ids discovered so far
-  total: number; // total inbox message count estimate
+  scanned: number;
+  checked?: number;
+  pendingTotal?: number;
+  total: number;
   inserted: number;
   failed: number;
   startedAt?: string;
+  finishedAt?: string;
+  nextSyncAt?: string | null;
 };
 
 export function InboxControls({
@@ -23,8 +26,6 @@ export function InboxControls({
 }) {
   const router = useRouter();
   const [syncPending, setSyncPending] = useState(false);
-  const [syncError, setSyncError] = useState<string | null>(null);
-  const [syncSuccess, setSyncSuccess] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncStatus | null>(null);
   const pollerRef = useRef<number | null>(null);
 
@@ -89,8 +90,6 @@ export function InboxControls({
 
   const onSync = async () => {
     setSyncPending(true);
-    setSyncError(null);
-    setSyncSuccess(false);
     startPolling();
 
     try {
@@ -111,17 +110,20 @@ export function InboxControls({
         }
         throw new Error(details || 'Failed to sync inbox');
       }
-      setSyncSuccess(true);
-      // One final read to display the completed progress snapshot.
       const statusResponse = await fetch(`${backendUrl}/api/go/sync/status`, {
         cache: 'no-store',
       });
       if (statusResponse.ok) {
         const status = (await statusResponse.json()) as SyncStatus;
         setSyncProgress(status);
+        toast.success(
+          `Synced ${status.inserted.toLocaleString()} new email${status.inserted !== 1 ? 's' : ''}`,
+        );
+      } else {
+        toast.success('Sync complete');
       }
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Failed to sync Gmail inbox');
+      toast.error(error instanceof Error ? error.message : 'Failed to sync Gmail inbox');
     } finally {
       stopPolling();
       setSyncPending(false);
@@ -130,37 +132,45 @@ export function InboxControls({
   };
 
   return (
-    <div className="mb-6 flex flex-wrap gap-3">
-      <a
-        href={connectUrl}
-        className="rounded-md bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-700"
-      >
-        Connect Gmail
-      </a>
-      <button
-        type="button"
-        onClick={onSync}
-        disabled={syncPending}
-        className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium hover:bg-gray-100 disabled:opacity-50"
-      >
-        {syncPending ? 'Syncing...' : 'Sync Inbox'}
-      </button>
+    <div className="mb-6 space-y-2">
+      <div className="flex flex-wrap gap-3">
+        <a
+          href={connectUrl}
+          className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          Connect Gmail
+        </a>
+        <button
+          type="button"
+          onClick={onSync}
+          disabled={syncPending}
+          className="rounded-md border border-input px-4 py-2 text-sm font-medium hover:bg-accent disabled:opacity-50"
+        >
+          {syncPending ? 'Syncing...' : 'Sync Inbox'}
+        </button>
 
-      {syncProgress?.running && (
-        <span className="self-center text-sm text-gray-600">
-          Scanning emails{syncProgress.total > 0
-            ? ` … ${syncProgress.checked ?? 0} / ${syncProgress.total}`
-            : '…'}
-        </span>
-      )}
-      {syncError && (
-        <span className="self-center text-sm text-red-600">{syncError}</span>
-      )}
-      {syncSuccess && (
-        <span className="self-center text-sm text-green-600">
-          Done
-        </span>
-      )}
+        {syncProgress?.running && (
+          <span className="self-center text-sm text-muted-foreground">
+            Scanning emails
+            {syncProgress.total > 0
+              ? ` … ${syncProgress.checked ?? 0} / ${syncProgress.total}`
+              : '…'}
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+        {syncProgress?.finishedAt && !syncProgress.running && (
+          <span>
+            Last sync: {new Date(syncProgress.finishedAt).toLocaleString()}
+          </span>
+        )}
+        {syncProgress?.nextSyncAt && (
+          <span>
+            Next sync: {new Date(syncProgress.nextSyncAt).toLocaleString()}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

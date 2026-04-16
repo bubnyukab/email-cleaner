@@ -1,0 +1,1 @@
+ALTER TABLE sender_emails ADD COLUMN IF NOT EXISTS size_bytes BIGINT;

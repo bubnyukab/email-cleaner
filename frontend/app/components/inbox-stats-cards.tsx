@@ -3,6 +3,14 @@
 import { useEffect, useState } from 'react';
 import type { InboxStats } from '@/lib/go/client';
 
+export function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const value = bytes / Math.pow(1024, i);
+  return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
 export function InboxStatsCards({
   backendUrl,
   initialStats,
@@ -44,19 +52,18 @@ export function InboxStatsCards({
 
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-      <div className="rounded-lg border border-gray-200 p-4">
-        <p className="text-sm text-gray-500">Inbox emails scanned</p>
-        <p className="mt-2 text-3xl font-semibold">{stats.totalEmails}</p>
+      <div className="rounded-lg border border-border p-4">
+        <p className="text-sm text-muted-foreground">Emails scanned</p>
+        <p className="mt-2 text-3xl font-semibold">{stats.totalEmails.toLocaleString()}</p>
       </div>
-      <div className="rounded-lg border border-gray-200 p-4">
-        <p className="text-sm text-gray-500">Unique senders</p>
-        <p className="mt-2 text-3xl font-semibold">{stats.totalSenders}</p>
+      <div className="rounded-lg border border-border p-4">
+        <p className="text-sm text-muted-foreground">Unique senders</p>
+        <p className="mt-2 text-3xl font-semibold">{stats.totalSenders.toLocaleString()}</p>
       </div>
-      <div className="rounded-lg border border-gray-200 p-4">
-        <p className="text-sm text-gray-500">Connected Gmail accounts</p>
+      <div className="rounded-lg border border-border p-4">
+        <p className="text-sm text-muted-foreground">Connected accounts</p>
         <p className="mt-2 text-3xl font-semibold">{stats.connectedAccounts}</p>
       </div>
     </div>
   );
 }
-
