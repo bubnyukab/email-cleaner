@@ -64,8 +64,8 @@ async function SenderGroupsContent() {
                     </Link>
                   </td>
                   <td className="px-4 py-3 text-gray-600">{sender.email}</td>
-                  <td className="px-4 py-3">{sender.emailCount}</td>
-                  <td className="px-4 py-3">{sender.threadCount}</td>
+                  <td className="px-4 py-3">{Number(sender.emailCount ?? 0)}</td>
+                  <td className="px-4 py-3">{Number(sender.threadCount ?? 0)}</td>
                   <td className="px-4 py-3 text-gray-600">
                     {sender.lastReceivedAt
                       ? new Date(sender.lastReceivedAt).toLocaleString()

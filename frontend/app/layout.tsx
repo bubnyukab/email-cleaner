@@ -16,7 +16,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`bg-white text-gray-800 ${inter.className}`}>
+    <html
+      lang="en"
+      suppressHydrationWarning
+      className={`bg-white text-gray-800 ${inter.className}`}
+    >
       <body className="h-screen">
         <main className="grow overflow-hidden">{children}</main>
         <Toaster closeButton />

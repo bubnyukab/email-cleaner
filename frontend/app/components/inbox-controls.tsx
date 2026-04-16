@@ -1,12 +1,14 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 type SyncStatus = {
   running: boolean;
-  scanned: number;
-  total: number;
+  scanned: number; // processed uncached messages (new work)
+  checked?: number; // ids evaluated (cached + uncached)
+  pendingTotal?: number; // uncached message ids discovered so far
+  total: number; // total inbox message count estimate
   inserted: number;
   failed: number;
   startedAt?: string;
@@ -24,45 +26,18 @@ export function InboxControls({
   const [syncError, setSyncError] = useState<string | null>(null);
   const [syncSuccess, setSyncSuccess] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncStatus | null>(null);
+  const pollerRef = useRef<number | null>(null);
 
-  const syncProgressText = useMemo(() => {
-    if (!syncProgress) {
-      return null;
+  const stopPolling = () => {
+    if (pollerRef.current !== null) {
+      window.clearInterval(pollerRef.current);
+      pollerRef.current = null;
     }
-    const total = syncProgress.total > 0 ? syncProgress.total : '?';
-    return `${syncProgress.scanned}/${total}`;
-  }, [syncProgress]);
-
-  const etaText = useMemo(() => {
-    if (!syncProgress || !syncProgress.running) {
-      return null;
-    }
-    if (!syncProgress.startedAt || syncProgress.total <= 0 || syncProgress.scanned <= 0) {
-      return null;
-    }
-
-    const startedAtMs = new Date(syncProgress.startedAt).getTime();
-    if (Number.isNaN(startedAtMs)) {
-      return null;
-    }
-
-    const elapsedSeconds = (Date.now() - startedAtMs) / 1000;
-    if (elapsedSeconds <= 0) {
-      return null;
-    }
-
-    const rate = syncProgress.scanned / elapsedSeconds;
-    if (rate <= 0) {
-      return null;
-    }
-
-    const remaining = Math.max(syncProgress.total - syncProgress.scanned, 0);
-    const remainingSeconds = Math.round(remaining / rate);
-    return formatEta(remainingSeconds);
-  }, [syncProgress]);
+  };
 
   const startPolling = () => {
-    return window.setInterval(async () => {
+    stopPolling();
+    pollerRef.current = window.setInterval(async () => {
       try {
         const response = await fetch(`${backendUrl}/api/go/sync/status`, {
           cache: 'no-store',
@@ -72,24 +47,69 @@ export function InboxControls({
         }
         const status = (await response.json()) as SyncStatus;
         setSyncProgress(status);
+        setSyncPending(status.running);
+        if (!status.running) {
+          stopPolling();
+        }
       } catch {
         // Ignore transient polling errors while sync is running.
       }
     }, 500);
   };
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadInitialStatus = async () => {
+      try {
+        const response = await fetch(`${backendUrl}/api/go/sync/status`, {
+          cache: 'no-store',
+        });
+        if (!response.ok || cancelled) {
+          return;
+        }
+        const status = (await response.json()) as SyncStatus;
+        setSyncProgress(status);
+        if (status.running) {
+          setSyncPending(true);
+          startPolling();
+        }
+      } catch {
+        // Ignore initial status errors.
+      }
+    };
+
+    void loadInitialStatus();
+
+    return () => {
+      cancelled = true;
+      stopPolling();
+    };
+  }, [backendUrl]);
+
   const onSync = async () => {
     setSyncPending(true);
     setSyncError(null);
     setSyncSuccess(false);
-    const pollerId = startPolling();
+    startPolling();
 
     try {
       const response = await fetch(`${backendUrl}/api/go/sync/gmail`, {
         method: 'POST',
       });
       if (!response.ok) {
-        throw new Error('Failed to sync inbox');
+        let details: string | undefined;
+        try {
+          const body = (await response.json()) as { error?: string };
+          details = body?.error;
+        } catch {
+          try {
+            details = await response.text();
+          } catch {
+            // ignore
+          }
+        }
+        throw new Error(details || 'Failed to sync inbox');
       }
       setSyncSuccess(true);
       // One final read to display the completed progress snapshot.
@@ -100,10 +120,10 @@ export function InboxControls({
         const status = (await statusResponse.json()) as SyncStatus;
         setSyncProgress(status);
       }
-    } catch {
-      setSyncError('Failed to sync Gmail inbox');
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Failed to sync Gmail inbox');
     } finally {
-      window.clearInterval(pollerId);
+      stopPolling();
       setSyncPending(false);
       router.refresh();
     }
@@ -125,10 +145,12 @@ export function InboxControls({
       >
         {syncPending ? 'Syncing...' : 'Sync Inbox'}
       </button>
-      {syncPending && syncProgressText && (
+
+      {syncProgress?.running && (
         <span className="self-center text-sm text-gray-600">
-          Scanned: {syncProgressText}
-          {etaText ? ` | ETA: ${etaText}` : ''}
+          Scanning emails{syncProgress.total > 0
+            ? ` … ${syncProgress.checked ?? 0} / ${syncProgress.total}`
+            : '…'}
         </span>
       )}
       {syncError && (
@@ -136,23 +158,9 @@ export function InboxControls({
       )}
       {syncSuccess && (
         <span className="self-center text-sm text-green-600">
-          Inbox synced successfully
+          Done
         </span>
       )}
     </div>
   );
-}
-
-function formatEta(totalSeconds: number) {
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) {
-    return `${minutes}m ${seconds}s`;
-  }
-  const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
-  return `${hours}h ${remMinutes}m`;
 }

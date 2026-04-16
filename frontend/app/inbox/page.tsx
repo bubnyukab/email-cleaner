@@ -1,4 +1,5 @@
 import { InboxControls } from '@/app/components/inbox-controls';
+import { InboxStatsCards } from '@/app/components/inbox-stats-cards';
 import { NavMenu } from '@/app/components/menu';
 import { getInboxStats } from '@/lib/go/client';
 import Link from 'next/link';
@@ -42,20 +43,7 @@ async function InboxContent() {
       <div className="mx-auto max-w-4xl p-4 sm:p-6">
         <InboxControls connectUrl={connectUrl} backendUrl={publicBackendUrl} />
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-          <div className="rounded-lg border border-gray-200 p-4">
-            <p className="text-sm text-gray-500">Inbox emails scanned</p>
-            <p className="mt-2 text-3xl font-semibold">{stats.totalEmails}</p>
-          </div>
-          <div className="rounded-lg border border-gray-200 p-4">
-            <p className="text-sm text-gray-500">Unique senders</p>
-            <p className="mt-2 text-3xl font-semibold">{stats.totalSenders}</p>
-          </div>
-          <div className="rounded-lg border border-gray-200 p-4">
-            <p className="text-sm text-gray-500">Connected Gmail accounts</p>
-            <p className="mt-2 text-3xl font-semibold">{stats.connectedAccounts}</p>
-          </div>
-        </div>
+        <InboxStatsCards backendUrl={publicBackendUrl} initialStats={stats} />
 
         <div className="mt-6 rounded-lg border border-gray-200 p-4">
           <h2 className="text-lg font-semibold">Next Step</h2>

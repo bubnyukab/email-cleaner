@@ -38,7 +38,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`Backend request failed: ${response.status}`);
+    let details = '';
+    try {
+      const body = (await response.json()) as { error?: string };
+      details = body?.error ?? '';
+    } catch {
+      try {
+        details = await response.text();
+      } catch {
+        details = '';
+      }
+    }
+    const suffix = details ? ` - ${details}` : '';
+    throw new Error(`Backend request failed: ${response.status}${suffix}`);
   }
 
   return response.json() as Promise<T>;
@@ -64,4 +76,29 @@ export async function syncGmailInbox() {
       body: JSON.stringify({}),
     },
   );
+}
+
+export async function bulkTrashEmails(gmailMessageIds: string[]) {
+  return request<{
+    success: boolean;
+    connectedAs: string;
+    processed: number;
+    failedCount: number;
+    trashLabelId?: string;
+  }>('/api/go/emails/bulk/trash', {
+    method: 'POST',
+    body: JSON.stringify({ gmailMessageIds }),
+  });
+}
+
+export async function bulkDeleteEmails(gmailMessageIds: string[]) {
+  return request<{
+    success: boolean;
+    connectedAs: string;
+    processed: number;
+    failedCount: number;
+  }>('/api/go/emails/bulk/delete', {
+    method: 'POST',
+    body: JSON.stringify({ gmailMessageIds }),
+  });
 }

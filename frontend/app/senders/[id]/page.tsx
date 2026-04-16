@@ -2,6 +2,7 @@ import { NavMenu } from '@/app/components/menu';
 import { getSenderEmails, getSenderSummaries } from '@/lib/go/client';
 import Link from 'next/link';
 import { Suspense } from 'react';
+import SenderEmailsBulkActions from './email-bulk-actions';
 
 export default function SenderEmailsPage({
   params,
@@ -56,41 +57,7 @@ async function SenderEmailsContent({
           Back to sender groups
         </Link>
 
-        <div className="mt-4 overflow-hidden rounded-lg border border-gray-200">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-4 py-3 font-medium">Subject</th>
-                <th className="px-4 py-3 font-medium">Snippet</th>
-                <th className="px-4 py-3 font-medium">Received</th>
-              </tr>
-            </thead>
-            <tbody>
-              {emails.map((email) => (
-                <tr key={email.id} className="border-t border-gray-100 align-top">
-                  <td className="px-4 py-3 font-medium">
-                    {email.subject || '(No subject)'}
-                  </td>
-                  <td className="max-w-2xl px-4 py-3 text-gray-600">
-                    <div className="line-clamp-3">{email.snippet || email.bodyText}</div>
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-gray-600">
-                    {email.receivedAt
-                      ? new Date(email.receivedAt).toLocaleString()
-                      : '-'}
-                  </td>
-                </tr>
-              ))}
-              {emails.length === 0 && (
-                <tr>
-                  <td colSpan={3} className="px-4 py-6 text-center text-gray-500">
-                    No emails for this sender yet.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+        <SenderEmailsBulkActions emails={emails} />
       </div>
     </div>
   );
