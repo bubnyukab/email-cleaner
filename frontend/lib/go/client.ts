@@ -107,16 +107,6 @@ export async function getSenderEmails(senderId: string) {
   return request<SenderEmail[]>(`/api/go/senders/${senderId}/emails`);
 }
 
-export async function getSenderEmailsPaginated(
-  senderId: string,
-  page: number,
-  limit: number,
-) {
-  return request<PaginatedSenderEmails>(
-    `/api/go/senders/${senderId}/emails?page=${page}&limit=${limit}`,
-  );
-}
-
 export async function getLabels() {
   return request<string[]>('/api/go/labels');
 }
@@ -134,17 +124,6 @@ export async function putPreferences(prefs: Record<string, string>) {
     method: 'PUT',
     body: JSON.stringify(prefs),
   });
-}
-
-export async function syncGmailInbox(account?: string) {
-  const q = account ? `?account=${encodeURIComponent(account)}` : '';
-  return request<{ success: boolean; fetched: number; insertedCount: number }>(
-    `/api/go/sync/gmail${q}`,
-    {
-      method: 'POST',
-      body: JSON.stringify({}),
-    },
-  );
 }
 
 export async function bulkTrashEmails(gmailMessageIds: string[]) {

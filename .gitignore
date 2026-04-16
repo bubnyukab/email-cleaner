@@ -24,6 +24,11 @@ bin/
 *.out
 *.test
 
+# Go build artifacts
+/backend/api
+/backend/tmp/
+/old_files/cmd/app/email-cleaner
+
 # Go workspace file (optional)
 go.work
 
@@ -40,4 +45,14 @@ Thumbs.db
 # =========================
 docker-data/
 
-*.json
+# Ignore sensitive/generated JSON at specific locations only
+frontend/.next/**/*.json
+**/tsconfig.tsbuildinfo
+
+# =========================
+# Secrets / OAuth credentials
+# =========================
+credentials.json
+token.json
+**/credentials.json
+**/token.json
