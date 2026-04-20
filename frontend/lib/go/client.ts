@@ -9,6 +9,10 @@ export type SenderSummary = {
   id: number;
   email: string;
   displayName: string;
+  domain: string;
+  category: string;
+  keepScore: number;
+  hasInbox: boolean;
   emailCount: number;
   threadCount: number;
   totalSizeBytes?: number;
@@ -16,6 +20,18 @@ export type SenderSummary = {
   unsubscribedAt?: string | null;
   blockedAt?: string | null;
   lastReceivedAt?: string | null;
+};
+
+export type SenderDomainSummary = {
+  domain: string;
+  senderCount: number;
+  emailCount: number;
+  totalSizeBytes?: number;
+  lastReceivedAt?: string | null;
+  hasInbox: boolean;
+  category: string;
+  keepScore: number;
+  senderEmails: string[];
 };
 
 export type SenderEmail = {
@@ -103,12 +119,14 @@ export async function getInboxStats(account?: string) {
   return request<InboxStats>(`/api/go/inbox/stats${q}`);
 }
 
-export async function getSenderEmails(senderId: string) {
-  return request<SenderEmail[]>(`/api/go/senders/${senderId}/emails`);
+export async function getSenderEmails(senderId: string, account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
+  return request<SenderEmail[]>(`/api/go/senders/${senderId}/emails${q}`);
 }
 
-export async function getLabels() {
-  return request<string[]>('/api/go/labels');
+export async function getLabels(account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
+  return request<string[]>(`/api/go/labels${q}`);
 }
 
 export async function getAccounts() {
@@ -126,71 +144,84 @@ export async function putPreferences(prefs: Record<string, string>) {
   });
 }
 
-export async function bulkTrashEmails(gmailMessageIds: string[]) {
+export async function bulkTrashEmails(gmailMessageIds: string[], account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
   return request<{
     success: boolean;
     connectedAs: string;
     processed: number;
     failedCount: number;
     trashLabelId?: string;
-  }>('/api/go/emails/bulk/trash', {
+  }>(`/api/go/emails/bulk/trash${q}`, {
     method: 'POST',
     body: JSON.stringify({ gmailMessageIds }),
   });
 }
 
-export async function bulkTrashBySenders(senderIds: number[]) {
+export async function bulkTrashBySenders(senderIds: number[], account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
   return request<{
     success: boolean;
     processed: number;
     failedCount: number;
     gmailMessageIds?: string[];
-  }>('/api/go/senders/bulk/trash', {
+  }>(`/api/go/senders/bulk/trash${q}`, {
     method: 'POST',
     body: JSON.stringify({ senderIds }),
   });
 }
 
-export async function bulkUntrashEmails(gmailMessageIds: string[]) {
+export async function bulkUntrashEmails(gmailMessageIds: string[], account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
   return request<{
     success: boolean;
     processed: number;
     failedCount: number;
-  }>('/api/go/emails/bulk/untrash', {
+  }>(`/api/go/emails/bulk/untrash${q}`, {
     method: 'POST',
     body: JSON.stringify({ gmailMessageIds }),
   });
 }
 
-export async function unsubscribeFromSender(senderId: number) {
+export async function unsubscribeFromSender(senderId: number, account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
   return request<{
     success: boolean;
     method?: string;
     alreadyDone?: boolean;
-  }>(`/api/go/senders/${senderId}/unsubscribe`, {
+  }>(`/api/go/senders/${senderId}/unsubscribe${q}`, {
     method: 'POST',
     body: JSON.stringify({}),
   });
 }
 
-export async function blockSender(senderId: number) {
+export async function blockSender(senderId: number, account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
   return request<{
     success: boolean;
     alreadyDone?: boolean;
-  }>(`/api/go/senders/${senderId}/block`, {
+  }>(`/api/go/senders/${senderId}/block${q}`, {
     method: 'POST',
     body: JSON.stringify({}),
   });
 }
 
-export async function analyticsTopSenders() {
-  return request<AnalyticsTopSender[]>('/api/go/analytics/top-senders');
+export async function getSenderDomains(account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
+  return request<SenderDomainSummary[]>(`/api/go/senders/by-domain${q}`);
 }
 
-export async function analyticsTimeline() {
-  return request<AnalyticsTimelineEntry[]>('/api/go/analytics/timeline');
+export async function analyticsTopSenders(account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
+  return request<AnalyticsTopSender[]>(`/api/go/analytics/top-senders${q}`);
 }
 
-export async function analyticsLabels() {
-  return request<AnalyticsLabelEntry[]>('/api/go/analytics/labels');
+export async function analyticsTimeline(account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
+  return request<AnalyticsTimelineEntry[]>(`/api/go/analytics/timeline${q}`);
+}
+
+export async function analyticsLabels(account?: string) {
+  const q = account ? `?account=${encodeURIComponent(account)}` : '';
+  return request<AnalyticsLabelEntry[]>(`/api/go/analytics/labels${q}`);
 }

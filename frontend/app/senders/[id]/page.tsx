@@ -7,12 +7,14 @@ import SenderUnsubscribeButton from './unsubscribe-button';
 
 export default function SenderEmailsPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ account?: string; returnTo?: string }>;
 }) {
   return (
     <Suspense fallback={<SenderEmailsSkeleton />}>
-      <SenderEmailsContent params={params} />
+      <SenderEmailsContent params={params} searchParams={searchParams} />
     </Suspense>
   );
 }
@@ -33,14 +35,18 @@ function SenderEmailsSkeleton() {
 
 async function SenderEmailsContent({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ account?: string; returnTo?: string }>;
 }) {
   const { id } = await params;
+  const { account, returnTo } = await searchParams;
   const [emails, senders] = await Promise.all([
-    getSenderEmails(id),
-    getSenderSummaries(),
+    getSenderEmails(id, account),
+    getSenderSummaries({ account }),
   ]);
+  const backHref = returnTo ? decodeURIComponent(returnTo) : (account ? `/senders?account=${encodeURIComponent(account)}` : '/senders');
 
   const sender = senders.find((item) => String(item.id) === id);
 
@@ -55,7 +61,7 @@ async function SenderEmailsContent({
 
       <div className="mx-auto max-w-5xl p-4 sm:p-6">
         <div className="flex items-center gap-4">
-          <Link href="/senders" className="text-sm text-blue-600 hover:underline dark:text-blue-400">
+          <Link href={backHref} className="text-sm text-blue-600 hover:underline dark:text-blue-400">
             Back to sender groups
           </Link>
           {sender && (
@@ -64,11 +70,12 @@ async function SenderEmailsContent({
               email={sender.email}
               canUnsubscribe={sender.canUnsubscribe ?? false}
               unsubscribedAt={sender.unsubscribedAt ?? null}
+              account={account}
             />
           )}
         </div>
 
-        <SenderEmailsBulkActions emails={emails} />
+        <SenderEmailsBulkActions emails={emails} account={account} />
       </div>
     </div>
   );

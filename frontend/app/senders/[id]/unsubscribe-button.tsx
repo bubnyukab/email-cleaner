@@ -11,11 +11,13 @@ export default function SenderUnsubscribeButton({
   email,
   canUnsubscribe,
   unsubscribedAt,
+  account,
 }: {
   senderId: number;
   email: string;
   canUnsubscribe: boolean;
   unsubscribedAt: string | null;
+  account?: string;
 }) {
   const router = useRouter();
   const [pending, setPending] = useState(false);
@@ -39,7 +41,7 @@ export default function SenderUnsubscribeButton({
   const onClick = async () => {
     setPending(true);
     try {
-      await unsubscribeFromSender(senderId);
+      await unsubscribeFromSender(senderId, account);
       toast.success(`Unsubscribed from ${email}`);
       router.refresh();
     } catch (e) {

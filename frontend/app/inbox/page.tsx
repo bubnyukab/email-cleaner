@@ -7,10 +7,12 @@ import { getInboxStats } from '@/lib/go/client';
 import Link from 'next/link';
 import { Suspense } from 'react';
 
-export default function InboxPage() {
+type PageProps = { searchParams: Promise<{ account?: string }> };
+
+export default function InboxPage({ searchParams }: PageProps) {
   return (
     <Suspense fallback={<InboxSkeleton />}>
-      <InboxContent />
+      <InboxContent searchParams={searchParams} />
     </Suspense>
   );
 }
@@ -29,11 +31,13 @@ function InboxSkeleton() {
   );
 }
 
-async function InboxContent() {
-  const stats = await getInboxStats();
+async function InboxContent({ searchParams }: PageProps) {
+  const { account } = await searchParams;
+  const stats = await getInboxStats(account);
   const publicBackendUrl =
     process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8080';
   const connectUrl = `${publicBackendUrl}/api/go/auth/google/start`;
+  const sendersHref = account ? `/senders?account=${encodeURIComponent(account)}` : '/senders';
 
   return (
     <div className="h-screen overflow-auto">
@@ -46,9 +50,9 @@ async function InboxContent() {
       </div>
 
       <div className="mx-auto max-w-4xl p-4 sm:p-6">
-        <InboxControls connectUrl={connectUrl} backendUrl={publicBackendUrl} />
+        <InboxControls connectUrl={connectUrl} backendUrl={publicBackendUrl} account={account} />
 
-        <InboxStatsCards backendUrl={publicBackendUrl} initialStats={stats} />
+        <InboxStatsCards backendUrl={publicBackendUrl} initialStats={stats} account={account} />
 
         <div className="mt-6 rounded-lg border border-border p-4">
           <h2 className="text-lg font-semibold">Next Step</h2>
@@ -57,14 +61,14 @@ async function InboxContent() {
             sender thread in detail.
           </p>
           <Link
-            href="/senders"
+            href={sendersHref}
             className="mt-3 inline-block text-sm font-medium text-blue-600 hover:underline dark:text-blue-400"
           >
             View sender groups
           </Link>
         </div>
 
-        <AnalyticsDashboard />
+        <AnalyticsDashboard account={account} />
       </div>
     </div>
   );

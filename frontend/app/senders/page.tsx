@@ -3,7 +3,7 @@ import { getLabels, getSenderSummaries } from '@/lib/go/client';
 import { Suspense } from 'react';
 import SenderGroupsTable from './sender-groups-table';
 
-type PageProps = { searchParams: Promise<{ labels?: string }> };
+type PageProps = { searchParams: Promise<{ labels?: string; search?: string; sort?: string; order?: string; account?: string }> };
 
 export default function SenderGroupsPage({ searchParams }: PageProps) {
   return (
@@ -28,12 +28,21 @@ function SenderGroupsSkeleton() {
 }
 
 async function SenderGroupsContent({ searchParams }: PageProps) {
-  const { labels: labelsParam } = await searchParams;
+  const { labels: labelsParam, search, sort, order, account } = await searchParams;
+  const normalizedOrder = order === 'asc' || order === 'desc' ? order : 'desc';
+  const normalizedSort = sort === 'thread_count' || sort === 'display_name' || sort === 'last_received'
+    ? sort
+    : 'email_count';
 
   const [senders, labels] = await Promise.all([
-    // Server-side fetch already applies the label filter from the URL
-    getSenderSummaries({ labels: labelsParam }),
-    getLabels().catch(() => [] as string[]),
+    getSenderSummaries({
+      labels: labelsParam,
+      search,
+      sort: normalizedSort,
+      order: normalizedOrder,
+      account,
+    }),
+    getLabels(account).catch(() => [] as string[]),
   ]);
 
   return (
@@ -62,6 +71,10 @@ async function SenderGroupsContent({ searchParams }: PageProps) {
           senders={senders}
           labels={labels}
           initialLabelFilter={labelsParam}
+          initialSearch={search ?? ''}
+          initialSort={normalizedSort}
+          initialOrder={normalizedOrder}
+          account={account}
         />
       </div>
     </div>

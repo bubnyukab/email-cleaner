@@ -14,18 +14,21 @@ export function formatBytes(bytes: number): string {
 export function InboxStatsCards({
   backendUrl,
   initialStats,
+  account,
 }: {
   backendUrl: string;
   initialStats: InboxStats;
+  account?: string;
 }) {
   const [stats, setStats] = useState<InboxStats>(initialStats);
 
   useEffect(() => {
     let cancelled = false;
 
+    const accountQuery = account ? `?account=${encodeURIComponent(account)}` : '';
     const refreshStats = async () => {
       try {
-        const response = await fetch(`${backendUrl}/api/go/inbox/stats`, {
+        const response = await fetch(`${backendUrl}/api/go/inbox/stats${accountQuery}`, {
           cache: 'no-store',
         });
         if (!response.ok || cancelled) {
@@ -48,7 +51,7 @@ export function InboxStatsCards({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [backendUrl]);
+  }, [backendUrl, account]);
 
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">

@@ -86,6 +86,7 @@ func main() {
 	router.HandleFunc("/api/go/sync/status", app.getSyncStatus).Methods("GET")
 	router.HandleFunc("/api/go/inbox/stats", app.getInboxStats).Methods("GET")
 	router.HandleFunc("/api/go/senders", app.getSenders).Methods("GET")
+	router.HandleFunc("/api/go/senders/by-domain", app.getSendersByDomain).Methods("GET")
 	router.HandleFunc("/api/go/senders/{senderId}/emails", app.getSenderEmails).Methods("GET")
 	router.HandleFunc("/api/go/senders/{senderId}/unsubscribe", app.unsubscribeSender).Methods("POST")
 	router.HandleFunc("/api/go/emails/bulk/trash", app.bulkTrashEmails).Methods("POST")
@@ -484,12 +485,13 @@ func (a *api) syncGmail(w http.ResponseWriter, r *http.Request) {
 	close(messageIDs)
 	workers.Wait()
 
-	// Keep local counts aligned with the latest scanned snapshot so totals
-	// don't accumulate stale rows between sync runs.
-	if err := a.reconcileScannedSnapshot(allScannedIDs); err != nil {
-		a.setSyncError(err.Error())
-		http.Error(w, `{"error":"failed reconciling scanned snapshot"}`, http.StatusBadGateway)
-		return
+	// Keep local counts aligned with the latest scanned snapshot for this account.
+	if syncAccountID > 0 {
+		if err := a.reconcileScannedSnapshot(allScannedIDs, syncAccountID); err != nil {
+			a.setSyncError(err.Error())
+			http.Error(w, `{"error":"failed reconciling scanned snapshot"}`, http.StatusBadGateway)
+			return
+		}
 	}
 
 	// Keep the authoritative total from GetProfile; allScannedIDs may
@@ -558,7 +560,51 @@ func (a *api) markGmailMessageCached(messageID string) error {
 	return err
 }
 
-func (a *api) reconcileScannedSnapshot(scannedIDs []string) error {
+func (a *api) reconcileScannedSnapshot(scannedIDs []string, accountID int) error {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if len(scannedIDs) == 0 {
+		if _, err := tx.Exec(`DELETE FROM sender_emails WHERE gmail_account_id = $1`, accountID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			DELETE FROM senders s
+			WHERE s.gmail_account_id = $1
+			  AND NOT EXISTS (
+				SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id
+			  )
+		`, accountID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if _, err := tx.Exec(`
+		DELETE FROM sender_emails
+		WHERE gmail_account_id = $2
+		  AND gmail_message_id <> ALL($1)
+	`, pq.Array(scannedIDs), accountID); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+		DELETE FROM senders s
+		WHERE s.gmail_account_id = $1
+		  AND NOT EXISTS (
+			SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id
+		  )
+	`, accountID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (a *api) reconcileLegacyScannedSnapshot(scannedIDs []string) error {
 	tx, err := a.db.Begin()
 	if err != nil {
 		return err
@@ -569,9 +615,6 @@ func (a *api) reconcileScannedSnapshot(scannedIDs []string) error {
 		if _, err := tx.Exec(`DELETE FROM sender_emails`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM gmail_message_cache`); err != nil {
-			return err
-		}
 		if _, err := tx.Exec(`DELETE FROM senders`); err != nil {
 			return err
 		}
@@ -580,13 +623,6 @@ func (a *api) reconcileScannedSnapshot(scannedIDs []string) error {
 
 	if _, err := tx.Exec(`
 		DELETE FROM sender_emails
-		WHERE gmail_message_id <> ALL($1)
-	`, pq.Array(scannedIDs)); err != nil {
-		return err
-	}
-
-	if _, err := tx.Exec(`
-		DELETE FROM gmail_message_cache
 		WHERE gmail_message_id <> ALL($1)
 	`, pq.Array(scannedIDs)); err != nil {
 		return err
@@ -706,7 +742,7 @@ func (a *api) getInboxStats(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"failed querying email count"}`, http.StatusInternalServerError)
 			return
 		}
-		if err := a.db.QueryRow(`SELECT COUNT(*) FROM senders WHERE gmail_account_id = $1`, accountID).Scan(&stats.TotalSenders); err != nil {
+		if err := a.db.QueryRow(`SELECT COUNT(DISTINCT sender_id) FROM sender_emails WHERE gmail_account_id = $1`, accountID).Scan(&stats.TotalSenders); err != nil {
 			http.Error(w, `{"error":"failed querying sender count"}`, http.StatusInternalServerError)
 			return
 		}
@@ -764,6 +800,20 @@ func (a *api) getSenders(w http.ResponseWriter, r *http.Request) {
 	// Build WHERE conditions.
 	args := []any{}
 	conditions := []string{}
+	accountArgIdx := 0
+
+	if accountEmail != "" {
+		accountID, err := a.resolveAccountID(accountEmail)
+		if err == nil {
+			args = append(args, accountID)
+			accountArgIdx = len(args)
+			conditions = append(conditions, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM sender_emails se_acc
+				WHERE se_acc.sender_id = s.id
+				  AND se_acc.gmail_account_id = $%d
+			)`, accountArgIdx))
+		}
+	}
 
 	if search != "" {
 		args = append(args, "%"+search+"%")
@@ -777,19 +827,18 @@ func (a *api) getSenders(w http.ResponseWriter, r *http.Request) {
 		}
 		// Filter to senders that have at least one email with any of the requested labels.
 		args = append(args, pq.Array(labelList))
-		conditions = append(conditions, fmt.Sprintf(`EXISTS (
+		labelArgIdx := len(args)
+		labelCond := fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM sender_emails se2
 			WHERE se2.sender_id = s.id
-			  AND string_to_array(se2.label_ids, ',') && $%d
-		)`, len(args)))
-	}
-
-	if accountEmail != "" {
-		accountID, err := a.resolveAccountID(accountEmail)
-		if err == nil {
-			args = append(args, accountID)
-			conditions = append(conditions, fmt.Sprintf("s.gmail_account_id = $%d", len(args)))
+			  AND string_to_array(se2.label_ids, ',') && $%d`, labelArgIdx)
+		if accountArgIdx > 0 {
+			labelCond += fmt.Sprintf(`
+			  AND se2.gmail_account_id = $%d`, accountArgIdx)
 		}
+		labelCond += `
+		)`
+		conditions = append(conditions, labelCond)
 	}
 
 	whereClause := ""
@@ -803,24 +852,36 @@ func (a *api) getSenders(w http.ResponseWriter, r *http.Request) {
 		secondarySort = ", last_received_at DESC NULLS LAST"
 	}
 
+	joinClause := "LEFT JOIN sender_emails e ON e.sender_id = s.id"
+	if accountArgIdx > 0 {
+		joinClause += fmt.Sprintf(" AND e.gmail_account_id = $%d", accountArgIdx)
+	}
+
 	query := fmt.Sprintf(`
 		SELECT
 			s.id,
 			s.email,
 			COALESCE(NULLIF(s.display_name, ''), s.email) AS display_name,
+			COALESCE(NULLIF(SPLIT_PART(s.email, '@', 2), ''), s.email) AS domain,
 			COUNT(e.id) AS email_count,
 			COUNT(DISTINCT e.gmail_thread_id) AS thread_count,
 			COALESCE(SUM(e.size_bytes), 0) AS total_size_bytes,
 			(s.unsubscribe_url IS NOT NULL OR s.unsubscribe_mailto IS NOT NULL) AS can_unsubscribe,
 			s.unsubscribed_at,
 			s.blocked_at,
-			MAX(e.received_at) AS last_received_at
+			MAX(e.received_at) AS last_received_at,
+			COALESCE(BOOL_OR(COALESCE(e.list_unsubscribe, '') <> ''), FALSE) AS has_list_unsubscribe,
+			COALESCE(BOOL_OR('CATEGORY_PROMOTIONS' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_promotions,
+			COALESCE(BOOL_OR('CATEGORY_SOCIAL' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_social,
+			COALESCE(BOOL_OR('CATEGORY_UPDATES' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_updates,
+			COALESCE(BOOL_OR('CATEGORY_PERSONAL' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_personal,
+			COALESCE(BOOL_OR('INBOX' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_inbox
 		FROM senders s
-		LEFT JOIN sender_emails e ON e.sender_id = s.id
+		%s
 		%s
 		GROUP BY s.id, s.email, s.display_name, s.unsubscribe_url, s.unsubscribe_mailto, s.unsubscribed_at, s.blocked_at
 		ORDER BY %s %s NULLS LAST%s
-	`, whereClause, orderByCol, sortOrder, secondarySort)
+	`, joinClause, whereClause, orderByCol, sortOrder, secondarySort)
 
 	var rows *sql.Rows
 	var err error
@@ -838,22 +899,65 @@ func (a *api) getSenders(w http.ResponseWriter, r *http.Request) {
 	items := []senderSummary{}
 	for rows.Next() {
 		var item senderSummary
-		if err := rows.Scan(&item.ID, &item.Email, &item.DisplayName, &item.EmailCount, &item.ThreadCount, &item.TotalSizeBytes, &item.CanUnsubscribe, &item.UnsubscribedAt, &item.BlockedAt, &item.LastReceivedAt); err != nil {
+		var hasListUnsubscribe bool
+		var hasPromotions bool
+		var hasSocial bool
+		var hasUpdates bool
+		var hasPersonal bool
+		if err := rows.Scan(
+			&item.ID,
+			&item.Email,
+			&item.DisplayName,
+			&item.Domain,
+			&item.EmailCount,
+			&item.ThreadCount,
+			&item.TotalSizeBytes,
+			&item.CanUnsubscribe,
+			&item.UnsubscribedAt,
+			&item.BlockedAt,
+			&item.LastReceivedAt,
+			&hasListUnsubscribe,
+			&hasPromotions,
+			&hasSocial,
+			&hasUpdates,
+			&hasPersonal,
+			&item.HasInbox,
+		); err != nil {
 			http.Error(w, `{"error":"failed reading sender rows"}`, http.StatusInternalServerError)
 			return
 		}
+		item.Category = classifySenderCategory(item.Email, hasListUnsubscribe, hasPromotions, hasSocial, hasUpdates, hasPersonal, item.HasInbox)
+		item.KeepScore = scoreSender(item.Category, item.HasInbox)
 		items = append(items, item)
 	}
 	json.NewEncoder(w).Encode(items)
 }
 
 func (a *api) getLabels(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(`
+	accountEmail := strings.TrimSpace(r.URL.Query().Get("account"))
+	conditions := []string{"label_ids IS NOT NULL", "label_ids != ''"}
+	args := []any{}
+	if accountEmail != "" {
+		accountID, err := a.resolveAccountID(accountEmail)
+		if err == nil {
+			args = append(args, accountID)
+			conditions = append(conditions, fmt.Sprintf("gmail_account_id = $%d", len(args)))
+		}
+	}
+	whereClause := strings.Join(conditions, " AND ")
+	query := fmt.Sprintf(`
 		SELECT DISTINCT unnest(string_to_array(label_ids, ',')) AS label
 		FROM sender_emails
-		WHERE label_ids IS NOT NULL AND label_ids != ''
+		WHERE %s
 		ORDER BY label
-	`)
+	`, whereClause)
+	var rows *sql.Rows
+	var err error
+	if len(args) > 0 {
+		rows, err = a.db.Query(query, args...)
+	} else {
+		rows, err = a.db.Query(query)
+	}
 	if err != nil {
 		http.Error(w, `{"error":"failed querying labels"}`, http.StatusInternalServerError)
 		return
@@ -874,9 +978,125 @@ func (a *api) getLabels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(labels)
 }
 
+func (a *api) getSendersByDomain(w http.ResponseWriter, r *http.Request) {
+	accountEmail := strings.TrimSpace(r.URL.Query().Get("account"))
+	conditions := []string{}
+	args := []any{}
+	accountArgIdx := 0
+	if accountEmail != "" {
+		accountID, err := a.resolveAccountID(accountEmail)
+		if err == nil {
+			args = append(args, accountID)
+			accountArgIdx = len(args)
+			conditions = append(conditions, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM sender_emails se_acc
+				WHERE se_acc.sender_id = s.id
+				  AND se_acc.gmail_account_id = $%d
+			)`, accountArgIdx))
+		}
+	}
+	whereClause := ""
+	if len(conditions) > 0 {
+		whereClause = "WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	joinClause := "LEFT JOIN sender_emails e ON e.sender_id = s.id"
+	if accountArgIdx > 0 {
+		joinClause += fmt.Sprintf(" AND e.gmail_account_id = $%d", accountArgIdx)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(NULLIF(SPLIT_PART(s.email, '@', 2), ''), s.email) AS domain,
+			COUNT(DISTINCT s.id) AS sender_count,
+			COUNT(e.id) AS email_count,
+			COALESCE(SUM(e.size_bytes), 0) AS total_size_bytes,
+			MAX(e.received_at) AS last_received_at,
+			COALESCE(BOOL_OR(COALESCE(e.list_unsubscribe, '') <> ''), FALSE) AS has_list_unsubscribe,
+			COALESCE(BOOL_OR('CATEGORY_PROMOTIONS' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_promotions,
+			COALESCE(BOOL_OR('CATEGORY_SOCIAL' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_social,
+			COALESCE(BOOL_OR('CATEGORY_UPDATES' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_updates,
+			COALESCE(BOOL_OR('CATEGORY_PERSONAL' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_personal,
+			COALESCE(BOOL_OR('INBOX' = ANY(string_to_array(COALESCE(e.label_ids, ''), ','))), FALSE) AS has_inbox,
+			ARRAY_REMOVE(ARRAY_AGG(DISTINCT s.email), NULL) AS sender_emails
+		FROM senders s
+		%s
+		%s
+		GROUP BY domain
+		ORDER BY email_count DESC, domain ASC
+	`, joinClause, whereClause)
+	var rows *sql.Rows
+	var err error
+	if len(args) > 0 {
+		rows, err = a.db.Query(query, args...)
+	} else {
+		rows, err = a.db.Query(query)
+	}
+	if err != nil {
+		http.Error(w, `{"error":"failed querying sender domains"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type senderDomainSummary struct {
+		Domain         string     `json:"domain"`
+		SenderCount    int        `json:"senderCount"`
+		EmailCount     int        `json:"emailCount"`
+		TotalSizeBytes int64      `json:"totalSizeBytes"`
+		LastReceivedAt *time.Time `json:"lastReceivedAt"`
+		HasInbox       bool       `json:"hasInbox"`
+		Category       string     `json:"category"`
+		KeepScore      int        `json:"keepScore"`
+		SenderEmails   []string   `json:"senderEmails"`
+	}
+
+	items := []senderDomainSummary{}
+	for rows.Next() {
+		var item senderDomainSummary
+		var hasListUnsubscribe bool
+		var hasPromotions bool
+		var hasSocial bool
+		var hasUpdates bool
+		var hasPersonal bool
+		var senderEmails pq.StringArray
+		if err := rows.Scan(
+			&item.Domain,
+			&item.SenderCount,
+			&item.EmailCount,
+			&item.TotalSizeBytes,
+			&item.LastReceivedAt,
+			&hasListUnsubscribe,
+			&hasPromotions,
+			&hasSocial,
+			&hasUpdates,
+			&hasPersonal,
+			&item.HasInbox,
+			&senderEmails,
+		); err != nil {
+			http.Error(w, `{"error":"failed reading sender domain rows"}`, http.StatusInternalServerError)
+			return
+		}
+		item.Category = classifySenderCategory(item.Domain, hasListUnsubscribe, hasPromotions, hasSocial, hasUpdates, hasPersonal, item.HasInbox)
+		item.KeepScore = scoreSender(item.Category, item.HasInbox)
+		item.SenderEmails = []string(senderEmails)
+		items = append(items, item)
+	}
+	json.NewEncoder(w).Encode(items)
+}
+
 func (a *api) getSenderEmails(w http.ResponseWriter, r *http.Request) {
 	senderID := mux.Vars(r)["senderId"]
 	q := r.URL.Query()
+	accountEmail := strings.TrimSpace(q.Get("account"))
+	var accountID int
+	hasAccountScope := false
+	if accountEmail != "" {
+		resolvedID, err := a.resolveAccountID(accountEmail)
+		if err == nil {
+			accountID = resolvedID
+			hasAccountScope = true
+		}
+	}
 
 	page := 1
 	limit := 0 // 0 = no limit (backwards-compatible)
@@ -889,7 +1109,13 @@ func (a *api) getSenderEmails(w http.ResponseWriter, r *http.Request) {
 
 	// Total count for pagination metadata.
 	var total int
-	if err := a.db.QueryRow(`SELECT COUNT(*) FROM sender_emails WHERE sender_id = $1`, senderID).Scan(&total); err != nil {
+	countQuery := `SELECT COUNT(*) FROM sender_emails WHERE sender_id = $1`
+	countArgs := []any{senderID}
+	if hasAccountScope {
+		countQuery += ` AND gmail_account_id = $2`
+		countArgs = append(countArgs, accountID)
+	}
+	if err := a.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
 		http.Error(w, `{"error":"failed counting sender emails"}`, http.StatusInternalServerError)
 		return
 	}
@@ -912,11 +1138,20 @@ func (a *api) getSenderEmails(w http.ResponseWriter, r *http.Request) {
 	`
 	var rows *sql.Rows
 	var err error
+	queryArgs := []any{senderID}
+	if hasAccountScope {
+		queryArgs = append(queryArgs, accountID)
+		baseQuery = strings.Replace(baseQuery, "WHERE sender_id = $1", "WHERE sender_id = $1 AND gmail_account_id = $2", 1)
+	}
 	if limit > 0 {
 		offset := (page - 1) * limit
-		rows, err = a.db.Query(baseQuery+` LIMIT $2 OFFSET $3`, senderID, limit, offset)
+		if hasAccountScope {
+			rows, err = a.db.Query(baseQuery+` LIMIT $3 OFFSET $4`, senderID, accountID, limit, offset)
+		} else {
+			rows, err = a.db.Query(baseQuery+` LIMIT $2 OFFSET $3`, senderID, limit, offset)
+		}
 	} else {
-		rows, err = a.db.Query(baseQuery, senderID)
+		rows, err = a.db.Query(baseQuery, queryArgs...)
 	}
 	if err != nil {
 		http.Error(w, `{"error":"failed querying sender emails"}`, http.StatusInternalServerError)
@@ -962,7 +1197,8 @@ func (a *api) bulkTrashEmails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accountEmail, token, err := a.loadPrimaryToken()
+	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
+	accountEmail, token, err := a.loadTokenForAccount(requestedAccount)
 	if err != nil {
 		http.Error(w, `{"error":"connect Gmail first"}`, http.StatusBadRequest)
 		return
@@ -1076,7 +1312,8 @@ func (a *api) bulkDeleteEmails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accountEmail, token, err := a.loadPrimaryToken()
+	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
+	accountEmail, token, err := a.loadTokenForAccount(requestedAccount)
 	if err != nil {
 		http.Error(w, `{"error":"connect Gmail first"}`, http.StatusBadRequest)
 		return
@@ -1127,8 +1364,59 @@ func nullIfEmpty(s string) *string {
 	return &s
 }
 
+func classifySenderCategory(email string, hasListUnsubscribe bool, hasPromotions bool, hasSocial bool, hasUpdates bool, hasPersonal bool, hasInbox bool) string {
+	lower := strings.ToLower(email)
+	isNoReply := strings.Contains(lower, "noreply") ||
+		strings.Contains(lower, "no-reply") ||
+		strings.Contains(lower, "donotreply") ||
+		strings.Contains(lower, "notifications") ||
+		strings.Contains(lower, "alerts")
+
+	switch {
+	case hasListUnsubscribe:
+		return "Newsletter"
+	case hasPromotions:
+		return "Promotional"
+	case hasSocial:
+		return "Social"
+	case hasUpdates:
+		return "Notification"
+	case isNoReply:
+		return "No-reply"
+	case hasPersonal || hasInbox:
+		return "Personal"
+	default:
+		return "Other"
+	}
+}
+
+func scoreSender(category string, hasInbox bool) int {
+	score := 50
+	if hasInbox {
+		score += 20
+	}
+	switch category {
+	case "Personal":
+		score += 30
+	case "Newsletter":
+		score -= 30
+	case "No-reply":
+		score -= 20
+	case "Promotional":
+		score -= 20
+	}
+	if score < 0 {
+		return 0
+	}
+	if score > 100 {
+		return 100
+	}
+	return score
+}
+
 func (a *api) unsubscribeSender(w http.ResponseWriter, r *http.Request) {
 	senderID := mux.Vars(r)["senderId"]
+	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
 
 	var unsubURL, unsubMailto sql.NullString
 	var unsubscribedAt sql.NullTime
@@ -1194,7 +1482,7 @@ func (a *api) unsubscribeSender(w http.ResponseWriter, r *http.Request) {
 			mailto = mailto[7:]
 		}
 
-		_, token, err := a.loadPrimaryToken()
+		_, token, err := a.loadTokenForAccount(requestedAccount)
 		if err != nil {
 			http.Error(w, `{"error":"connect Gmail first"}`, http.StatusBadRequest)
 			return
@@ -1238,9 +1526,29 @@ func (a *api) bulkTrashBySenders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := a.db.Query(`
-		SELECT gmail_message_id FROM sender_emails WHERE sender_id = ANY($1)
-	`, pq.Array(req.SenderIds))
+	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
+	accountID := 0
+	hasAccountScope := false
+	if requestedAccount != "" {
+		if resolvedID, resolveErr := a.resolveAccountID(requestedAccount); resolveErr == nil {
+			accountID = resolvedID
+			hasAccountScope = true
+		}
+	}
+
+	var rows *sql.Rows
+	var err error
+	if hasAccountScope {
+		rows, err = a.db.Query(`
+			SELECT gmail_message_id
+			FROM sender_emails
+			WHERE sender_id = ANY($1) AND gmail_account_id = $2
+		`, pq.Array(req.SenderIds), accountID)
+	} else {
+		rows, err = a.db.Query(`
+			SELECT gmail_message_id FROM sender_emails WHERE sender_id = ANY($1)
+		`, pq.Array(req.SenderIds))
+	}
 	if err != nil {
 		http.Error(w, `{"error":"failed querying emails for senders"}`, http.StatusInternalServerError)
 		return
@@ -1266,7 +1574,7 @@ func (a *api) bulkTrashBySenders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accountEmail, token, err := a.loadPrimaryToken()
+	accountEmail, token, err := a.loadTokenForAccount(requestedAccount)
 	if err != nil {
 		http.Error(w, `{"error":"connect Gmail first"}`, http.StatusBadRequest)
 		return
@@ -1372,7 +1680,8 @@ func (a *api) bulkUntrashEmails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, token, err := a.loadPrimaryToken()
+	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
+	_, token, err := a.loadTokenForAccount(requestedAccount)
 	if err != nil {
 		http.Error(w, `{"error":"connect Gmail first"}`, http.StatusBadRequest)
 		return
@@ -1531,16 +1840,38 @@ func jsonContentTypeMiddleware(next http.Handler) http.Handler {
 // ── Analytics handlers ────────────────────────────────────────────────────────
 
 func (a *api) analyticsTopSenders(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(`
+	accountEmail := strings.TrimSpace(r.URL.Query().Get("account"))
+	args := []any{}
+	whereClause := ""
+	if accountEmail != "" {
+		accountID, err := a.resolveAccountID(accountEmail)
+		if err != nil {
+			http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+			return
+		}
+		args = append(args, accountID)
+		whereClause = fmt.Sprintf("WHERE e.gmail_account_id = $%d", len(args))
+	}
+
+	query := fmt.Sprintf(`
 		SELECT
 			COALESCE(NULLIF(s.display_name, ''), s.email) AS display_name,
 			COUNT(e.id) AS email_count
 		FROM senders s
 		JOIN sender_emails e ON e.sender_id = s.id
+		%s
 		GROUP BY s.id, s.email, s.display_name
 		ORDER BY email_count DESC
 		LIMIT 10
-	`)
+	`, whereClause)
+
+	var rows *sql.Rows
+	var err error
+	if len(args) > 0 {
+		rows, err = a.db.Query(query, args...)
+	} else {
+		rows, err = a.db.Query(query)
+	}
 	if err != nil {
 		http.Error(w, `{"error":"failed querying top senders"}`, http.StatusInternalServerError)
 		return
@@ -1564,15 +1895,35 @@ func (a *api) analyticsTopSenders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) analyticsTimeline(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(`
+	accountEmail := strings.TrimSpace(r.URL.Query().Get("account"))
+	args := []any{}
+	conditions := []string{"received_at >= NOW() - INTERVAL '180 days'"}
+	if accountEmail != "" {
+		accountID, err := a.resolveAccountID(accountEmail)
+		if err != nil {
+			http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+			return
+		}
+		args = append(args, accountID)
+		conditions = append(conditions, fmt.Sprintf("gmail_account_id = $%d", len(args)))
+	}
+	query := fmt.Sprintf(`
 		SELECT
 			date_trunc('day', received_at)::date AS day,
 			COUNT(*) AS count
 		FROM sender_emails
-		WHERE received_at >= NOW() - INTERVAL '180 days'
+		WHERE %s
 		GROUP BY day
 		ORDER BY day
-	`)
+	`, strings.Join(conditions, " AND "))
+
+	var rows *sql.Rows
+	var err error
+	if len(args) > 0 {
+		rows, err = a.db.Query(query, args...)
+	} else {
+		rows, err = a.db.Query(query)
+	}
 	if err != nil {
 		http.Error(w, `{"error":"failed querying timeline"}`, http.StatusInternalServerError)
 		return
@@ -1598,15 +1949,35 @@ func (a *api) analyticsTimeline(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) analyticsLabels(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(`
+	accountEmail := strings.TrimSpace(r.URL.Query().Get("account"))
+	args := []any{}
+	conditions := []string{"label_ids IS NOT NULL", "label_ids != ''"}
+	if accountEmail != "" {
+		accountID, err := a.resolveAccountID(accountEmail)
+		if err != nil {
+			http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+			return
+		}
+		args = append(args, accountID)
+		conditions = append(conditions, fmt.Sprintf("gmail_account_id = $%d", len(args)))
+	}
+	query := fmt.Sprintf(`
 		SELECT
 			unnest(string_to_array(label_ids, ',')) AS label,
 			COUNT(*) AS count
 		FROM sender_emails
-		WHERE label_ids IS NOT NULL AND label_ids != ''
+		WHERE %s
 		GROUP BY label
 		ORDER BY count DESC
-	`)
+	`, strings.Join(conditions, " AND "))
+
+	var rows *sql.Rows
+	var err error
+	if len(args) > 0 {
+		rows, err = a.db.Query(query, args...)
+	} else {
+		rows, err = a.db.Query(query)
+	}
 	if err != nil {
 		http.Error(w, `{"error":"failed querying label analytics"}`, http.StatusInternalServerError)
 		return
@@ -1696,6 +2067,7 @@ func (a *api) exportSendersCSV(w http.ResponseWriter, r *http.Request) {
 
 func (a *api) blockSender(w http.ResponseWriter, r *http.Request) {
 	senderID := mux.Vars(r)["senderId"]
+	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
 
 	var senderEmail string
 	var blockedAt sql.NullTime
@@ -1715,7 +2087,7 @@ func (a *api) blockSender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, token, err := a.loadPrimaryToken()
+	_, token, err := a.loadTokenForAccount(requestedAccount)
 	if err != nil {
 		http.Error(w, `{"error":"connect Gmail first"}`, http.StatusBadRequest)
 		return
@@ -1895,6 +2267,7 @@ func (a *api) triggerSync() {
 			return
 		}
 		a.setSyncConnectedAccount(accountEmail)
+		syncAccountID, _ := a.resolveAccountID(accountEmail)
 
 		_, _ = a.db.Exec(`
 			INSERT INTO gmail_message_cache (gmail_message_id)
@@ -1943,7 +2316,7 @@ func (a *api) triggerSync() {
 						a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
 						continue
 					}
-					ok, storeErr := a.storeGmailMessage(msg)
+					ok, storeErr := a.storeGmailMessage(msg, syncAccountID)
 					if storeErr != nil {
 						a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
 						continue
@@ -2027,8 +2400,15 @@ func (a *api) triggerSync() {
 		close(messageIDs)
 		workers.Wait()
 
-		if err := a.reconcileScannedSnapshot(allScannedIDs); err != nil {
-			a.setSyncError(err.Error())
+		if syncAccountID > 0 {
+			if err := a.reconcileScannedSnapshot(allScannedIDs, syncAccountID); err != nil {
+				a.setSyncError(err.Error())
+			}
+		} else {
+			// Backwards compatibility fallback if account id cannot be resolved.
+			if err := a.reconcileLegacyScannedSnapshot(allScannedIDs); err != nil {
+				a.setSyncError(err.Error())
+			}
 		}
 		log.Printf("scheduled sync completed: inserted=%d failed=%d", a.syncStatus.Inserted, a.syncStatus.Failed)
 	}()

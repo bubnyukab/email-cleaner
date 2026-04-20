@@ -9,7 +9,7 @@ import {
   type SenderSortCol,
   type SenderSummary,
 } from '@/lib/go/client';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { toast } from 'sonner';
 import Link from 'next/link';
@@ -24,9 +24,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 type SortState = { col: SenderSortCol; order: 'asc' | 'desc' };
+type QuickFilter = 'newsletter' | 'noreply' | 'neverInbox' | 'oneEmail' | 'olderYear';
 
 const LABEL_DISPLAY: Record<string, string> = {
   INBOX: 'Inbox',
@@ -42,7 +41,6 @@ const LABEL_DISPLAY: Record<string, string> = {
   STARRED: 'Starred',
 };
 
-// Labels shown as filter chips, in display order.
 const CHIP_ORDER = [
   'CATEGORY_PERSONAL',
   'CATEGORY_PROMOTIONS',
@@ -57,11 +55,24 @@ const CHIP_ORDER = [
   'STARRED',
 ];
 
+type DomainGroup = {
+  domain: string;
+  senderIds: number[];
+  senderCount: number;
+  emailCount: number;
+  threadCount: number;
+  totalSizeBytes: number;
+  lastReceivedAt?: string | null;
+  category: string;
+  keepScore: number;
+  hasInbox: boolean;
+  exampleSenderId: number;
+};
+
 function labelName(raw: string) {
   return LABEL_DISPLAY[raw] ?? raw;
 }
 
-/** UTC-based date — identical on server and client, avoids hydration mismatch. */
 function formatDate(v: string | Date | null | undefined): string {
   if (!v) return '—';
   const d = new Date(v);
@@ -78,17 +89,68 @@ function SortIcon({ col, sort }: { col: SenderSortCol; sort: SortState }) {
   );
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+function categoryBadgeClass(category: string) {
+  switch (category) {
+    case 'Newsletter':
+      return 'bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300';
+    case 'Promotional':
+      return 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300';
+    case 'Social':
+      return 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300';
+    case 'Notification':
+      return 'bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200';
+    case 'No-reply':
+      return 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300';
+    case 'Personal':
+      return 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300';
+    default:
+      return 'bg-muted text-muted-foreground';
+  }
+}
+
+function scoreDotClass(score: number) {
+  if (score >= 70) return 'bg-green-500';
+  if (score >= 40) return 'bg-yellow-500';
+  return 'bg-red-500';
+}
+
+function buildQueryString({
+  search,
+  sort,
+  labels,
+  account,
+}: {
+  search: string;
+  sort: SortState;
+  labels: Set<string>;
+  account?: string;
+}) {
+  const params = new URLSearchParams();
+  if (search.trim()) params.set('search', search.trim());
+  if (labels.size > 0) params.set('labels', Array.from(labels).join(','));
+  params.set('sort', sort.col);
+  params.set('order', sort.order);
+  if (account) params.set('account', account);
+  const query = params.toString();
+  return query ? `?${query}` : '';
+}
 
 export default function SenderGroupsTable({
   senders: initialSenders,
   labels: availableLabels = [],
   initialLabelFilter,
+  initialSearch = '',
+  initialSort = 'email_count',
+  initialOrder = 'desc',
+  account,
 }: {
   senders: SenderSummary[];
   labels?: string[];
-  /** Comma-separated label IDs from the URL — used to restore filter state on back navigation. */
   initialLabelFilter?: string;
+  initialSearch?: string;
+  initialSort?: string;
+  initialOrder?: string;
+  account?: string;
 }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -99,8 +161,13 @@ export default function SenderGroupsTable({
   const [unsubPending, setUnsubPending] = useState<Set<number>>(() => new Set());
   const [blockPending, setBlockPending] = useState<Set<number>>(() => new Set());
   const [trashDialogSender, setTrashDialogSender] = useState<SenderSummary | null>(null);
-  const [search, setSearch] = useState('');
-  const [sort, setSort] = useState<SortState>({ col: 'email_count', order: 'desc' });
+  const [search, setSearch] = useState(initialSearch);
+  const [sort, setSort] = useState<SortState>({
+    col: (initialSort as SenderSortCol) || 'email_count',
+    order: initialOrder === 'asc' ? 'asc' : 'desc',
+  });
+  const [groupByDomain, setGroupByDomain] = useState(false);
+  const [quickFilter, setQuickFilter] = useState<QuickFilter | null>(null);
   const [activeLabels, setActiveLabels] = useState<Set<string>>(() =>
     initialLabelFilter
       ? new Set(initialLabelFilter.split(',').filter(Boolean))
@@ -108,8 +175,20 @@ export default function SenderGroupsTable({
   );
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Only show chips for labels that exist in the data, in our preferred order.
   const filterableLabels = CHIP_ORDER.filter((l) => availableLabels.includes(l));
+
+  const syncURL = useCallback(
+    (nextSearch: string, nextSort: SortState, nextLabels: Set<string>) => {
+      const query = buildQueryString({
+        search: nextSearch,
+        sort: nextSort,
+        labels: nextLabels,
+        account,
+      });
+      router.replace(`${pathname}${query}`, { scroll: false });
+    },
+    [account, pathname, router],
+  );
 
   const fetchSenders = useCallback(
     async (searchVal: string, sortVal: SortState, labelsVal: Set<string>) => {
@@ -119,35 +198,19 @@ export default function SenderGroupsTable({
           sort: sortVal.col,
           order: sortVal.order,
           labels: labelsVal.size > 0 ? Array.from(labelsVal).join(',') : undefined,
+          account,
         });
         setSenders(data);
       } catch {
         // Keep existing data on error.
       }
     },
-    [],
-  );
-
-  /**
-   * Writes the active labels into the URL as ?labels=... using replace so
-   * that toggling chips does NOT create browser history entries.
-   * When the user navigates to a sender and hits Back, the browser restores
-   * the full URL (including these params) so the filters reappear.
-   * When the user navigates away via the nav and then clicks Sender Groups
-   * again, they land on the clean /senders URL — filters start fresh.
-   */
-  const syncURL = useCallback(
-    (labelsVal: Set<string>) => {
-      const query = labelsVal.size > 0
-        ? `?labels=${Array.from(labelsVal).join(',')}`
-        : '';
-      router.replace(`${pathname}${query}`, { scroll: false });
-    },
-    [pathname, router],
+    [account],
   );
 
   const onSearchChange = (value: string) => {
     setSearch(value);
+    syncURL(value, sort, activeLabels);
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
     searchDebounceRef.current = setTimeout(() => {
       void fetchSenders(value, sort, activeLabels);
@@ -160,37 +223,109 @@ export default function SenderGroupsTable({
         ? { col, order: sort.order === 'desc' ? 'asc' : 'desc' }
         : { col, order: 'desc' };
     setSort(next);
+    syncURL(search, next, activeLabels);
     void fetchSenders(search, next, activeLabels);
   };
 
   const onLabelToggle = (label: string) => {
-    setActiveLabels((prev) => {
-      const next = new Set(prev);
-      if (next.has(label)) next.delete(label);
-      else next.add(label);
-      void fetchSenders(search, sort, next);
-      syncURL(next);
-      return next;
-    });
+    const next = new Set(activeLabels);
+    if (next.has(label)) next.delete(label);
+    else next.add(label);
+    setActiveLabels(next);
+    syncURL(search, sort, next);
+    void fetchSenders(search, sort, next);
   };
 
   const onClearLabels = () => {
     const empty = new Set<string>();
     setActiveLabels(empty);
+    syncURL(search, sort, empty);
     void fetchSenders(search, sort, empty);
-    syncURL(empty);
   };
 
   useEffect(() => {
     setSenders(initialSenders);
   }, [initialSenders]);
 
-  const allIds = senders.map((s) => s.id);
+  const visibleSenders = useMemo(() => {
+    if (!quickFilter) return senders;
+    const cutoff = new Date();
+    cutoff.setFullYear(cutoff.getFullYear() - 1);
+    return senders.filter((sender) => {
+      if (quickFilter === 'newsletter') return sender.category === 'Newsletter';
+      if (quickFilter === 'noreply') return sender.category === 'No-reply';
+      if (quickFilter === 'neverInbox') return !sender.hasInbox;
+      if (quickFilter === 'oneEmail') return (sender.emailCount ?? 0) === 1;
+      if (!sender.lastReceivedAt) return false;
+      return new Date(sender.lastReceivedAt) < cutoff;
+    });
+  }, [quickFilter, senders]);
+
+  const domainGroups = useMemo<DomainGroup[]>(() => {
+    const byDomain = new Map<string, DomainGroup>();
+    for (const sender of visibleSenders) {
+      const key = sender.domain || sender.email;
+      const existing = byDomain.get(key);
+      if (!existing) {
+        byDomain.set(key, {
+          domain: key,
+          senderIds: [sender.id],
+          senderCount: 1,
+          emailCount: sender.emailCount ?? 0,
+          threadCount: sender.threadCount ?? 0,
+          totalSizeBytes: sender.totalSizeBytes ?? 0,
+          lastReceivedAt: sender.lastReceivedAt ?? null,
+          category: sender.category,
+          keepScore: sender.keepScore ?? 0,
+          hasInbox: sender.hasInbox ?? false,
+          exampleSenderId: sender.id,
+        });
+        continue;
+      }
+      existing.senderIds.push(sender.id);
+      existing.senderCount += 1;
+      existing.emailCount += sender.emailCount ?? 0;
+      existing.threadCount += sender.threadCount ?? 0;
+      existing.totalSizeBytes += sender.totalSizeBytes ?? 0;
+      if (
+        sender.lastReceivedAt &&
+        (!existing.lastReceivedAt || new Date(sender.lastReceivedAt) > new Date(existing.lastReceivedAt))
+      ) {
+        existing.lastReceivedAt = sender.lastReceivedAt;
+      }
+      if ((sender.keepScore ?? 0) < existing.keepScore) {
+        existing.keepScore = sender.keepScore ?? 0;
+      }
+      if (sender.category === 'Newsletter' || existing.category === 'Newsletter') {
+        existing.category = 'Newsletter';
+      }
+      existing.hasInbox = existing.hasInbox || !!sender.hasInbox;
+    }
+    return Array.from(byDomain.values()).sort((a, b) => b.emailCount - a.emailCount);
+  }, [visibleSenders]);
+
+  const allIds = visibleSenders.map((s) => s.id);
   const selectedCount = selected.size;
   const allSelected = allIds.length > 0 && selectedCount === allIds.length;
-  const selectedEmailCount = senders
+  const selectedEmailCount = visibleSenders
     .filter((s) => selected.has(s.id))
     .reduce((sum, s) => sum + (s.emailCount ?? 0), 0);
+
+  useEffect(() => {
+    const visibleIds = new Set(visibleSenders.map((sender) => sender.id));
+    setSelected((prev) => {
+      const next = new Set(Array.from(prev).filter((id) => visibleIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [visibleSenders]);
+
+  const currentQuery = buildQueryString({
+    search,
+    sort,
+    labels: activeLabels,
+    account,
+  });
+  const returnTo = encodeURIComponent(`${pathname}${currentQuery}`);
 
   const toggleOne = (id: number, checked: boolean) =>
     setSelected((prev) => {
@@ -200,8 +335,22 @@ export default function SenderGroupsTable({
       return next;
     });
 
+  const toggleGroup = (ids: number[], checked: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+
   const toggleAll = (checked: boolean) =>
     setSelected(checked ? new Set(allIds) : new Set());
+
+  const applyQuickSelect = (kind: QuickFilter) => {
+    setQuickFilter((prev) => (prev === kind ? null : kind));
+  };
 
   const onTrashSelected = async () => {
     if (selectedCount === 0) return;
@@ -211,7 +360,7 @@ export default function SenderGroupsTable({
     if (!ok) return;
     setPendingOp(true);
     try {
-      const result = await bulkTrashBySenders(Array.from(selected));
+      const result = await bulkTrashBySenders(Array.from(selected), account);
       const trashedIds = result.gmailMessageIds ?? [];
       setSelected(new Set());
       router.refresh();
@@ -221,7 +370,7 @@ export default function SenderGroupsTable({
             label: 'Undo',
             onClick: async () => {
               try {
-                await bulkUntrashEmails(trashedIds);
+                await bulkUntrashEmails(trashedIds, account);
                 toast.success('Restored emails from trash');
                 router.refresh();
               } catch {
@@ -245,7 +394,7 @@ export default function SenderGroupsTable({
     setTrashDialogSender(null);
     setPendingOp(true);
     try {
-      const result = await bulkTrashBySenders([sender.id]);
+      const result = await bulkTrashBySenders([sender.id], account);
       const trashedIds = result.gmailMessageIds ?? [];
       router.refresh();
       if (trashedIds.length > 0) {
@@ -254,7 +403,7 @@ export default function SenderGroupsTable({
             label: 'Undo',
             onClick: async () => {
               try {
-                await bulkUntrashEmails(trashedIds);
+                await bulkUntrashEmails(trashedIds, account);
                 toast.success('Restored emails from trash');
                 router.refresh();
               } catch {
@@ -277,7 +426,7 @@ export default function SenderGroupsTable({
   const onUnsubscribe = async (sender: SenderSummary) => {
     setUnsubPending((prev) => new Set(prev).add(sender.id));
     try {
-      await unsubscribeFromSender(sender.id);
+      await unsubscribeFromSender(sender.id, account);
       toast.success(`Unsubscribed from ${sender.email}`);
       router.refresh();
     } catch (e) {
@@ -294,7 +443,7 @@ export default function SenderGroupsTable({
   const onBlock = async (sender: SenderSummary) => {
     setBlockPending((prev) => new Set(prev).add(sender.id));
     try {
-      await blockSender(sender.id);
+      await blockSender(sender.id, account);
       toast.success(`Blocked ${sender.email}`);
       router.refresh();
     } catch (e) {
@@ -319,13 +468,12 @@ export default function SenderGroupsTable({
     </button>
   );
 
-  const noResults = search || activeLabels.size > 0
+  const noResults = search || activeLabels.size > 0 || !!quickFilter
     ? 'No senders match your filters.'
     : 'No sender data yet.';
 
   return (
     <>
-      {/* Trash confirmation dialog */}
       <Dialog
         open={trashDialogSender !== null}
         onOpenChange={(open) => { if (!open) setTrashDialogSender(null); }}
@@ -358,7 +506,6 @@ export default function SenderGroupsTable({
         )}
       </Dialog>
 
-      {/* Search + count */}
       <div className="mb-3 flex flex-wrap items-center gap-3">
         <input
           type="search"
@@ -367,10 +514,32 @@ export default function SenderGroupsTable({
           placeholder="Search by name or email…"
           className="w-full max-w-sm rounded-md border border-input bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-ring"
         />
-        <span className="text-sm text-muted-foreground">{senders.length} senders</span>
+        <span className="text-sm text-muted-foreground">
+          {visibleSenders.length} sender{visibleSenders.length === 1 ? '' : 's'}
+          {quickFilter ? ` (filtered from ${senders.length})` : ''}
+        </span>
+        <button
+          type="button"
+          onClick={() => setGroupByDomain((prev) => !prev)}
+          className="rounded-md border border-input px-3 py-1.5 text-xs font-medium hover:bg-accent"
+        >
+          {groupByDomain ? 'Show by sender' : 'Group by domain'}
+        </button>
       </div>
 
-      {/* Category filter chips */}
+      <div className="mb-3 flex flex-wrap gap-2">
+        <button type="button" onClick={() => applyQuickSelect('newsletter')} className={`rounded-full border px-3 py-1 text-xs ${quickFilter === 'newsletter' ? 'border-foreground bg-foreground text-background' : 'hover:bg-accent'}`}>All Newsletters</button>
+        <button type="button" onClick={() => applyQuickSelect('noreply')} className={`rounded-full border px-3 py-1 text-xs ${quickFilter === 'noreply' ? 'border-foreground bg-foreground text-background' : 'hover:bg-accent'}`}>All No-reply</button>
+        <button type="button" onClick={() => applyQuickSelect('neverInbox')} className={`rounded-full border px-3 py-1 text-xs ${quickFilter === 'neverInbox' ? 'border-foreground bg-foreground text-background' : 'hover:bg-accent'}`}>Never in Inbox</button>
+        <button type="button" onClick={() => applyQuickSelect('oneEmail')} className={`rounded-full border px-3 py-1 text-xs ${quickFilter === 'oneEmail' ? 'border-foreground bg-foreground text-background' : 'hover:bg-accent'}`}>1 email only</button>
+        <button type="button" onClick={() => applyQuickSelect('olderYear')} className={`rounded-full border px-3 py-1 text-xs ${quickFilter === 'olderYear' ? 'border-foreground bg-foreground text-background' : 'hover:bg-accent'}`}>Older than 1 year</button>
+        {quickFilter && (
+          <button type="button" onClick={() => setQuickFilter(null)} className="rounded-full border border-dashed px-3 py-1 text-xs text-muted-foreground hover:border-foreground hover:text-foreground">
+            Clear quick filter
+          </button>
+        )}
+      </div>
+
       {filterableLabels.length > 0 && (
         <div className="mb-4 flex flex-wrap gap-2">
           {filterableLabels.map((label) => {
@@ -403,7 +572,6 @@ export default function SenderGroupsTable({
         </div>
       )}
 
-      {/* Bulk trash bar */}
       {selectedCount > 0 && (
         <div className="mb-3 flex items-center gap-3">
           <button
@@ -419,7 +587,6 @@ export default function SenderGroupsTable({
         </div>
       )}
 
-      {/* Desktop table */}
       <div className="hidden overflow-hidden rounded-lg border border-border sm:block">
         <table className="w-full text-left text-sm">
           <thead className="bg-muted text-muted-foreground">
@@ -430,93 +597,130 @@ export default function SenderGroupsTable({
                   aria-label="Select all senders"
                   checked={allSelected}
                   onChange={(e) => toggleAll(e.target.checked)}
-                  disabled={senders.length === 0 || pendingOp}
+                  disabled={visibleSenders.length === 0 || pendingOp}
                 />
               </th>
-              <th className="px-3 py-3">{thBtn('display_name', 'Sender')}</th>
-              <th className="px-3 py-3 font-medium">Email</th>
+              <th className="px-3 py-3">{thBtn('display_name', groupByDomain ? 'Domain' : 'Sender')}</th>
+              {!groupByDomain && <th className="px-3 py-3 font-medium">Email</th>}
+              <th className="px-3 py-3 font-medium">Category</th>
               <th className="w-20 px-3 py-3 text-right">{thBtn('email_count', 'Emails')}</th>
               <th className="w-28 whitespace-nowrap px-3 py-3">{thBtn('last_received', 'Last received')}</th>
               <th className="w-24 px-3 py-3 font-medium">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {senders.map((sender) => (
-              <tr key={sender.id} className="border-t border-border hover:bg-muted/30">
-                <td className="w-10 px-3 py-3">
-                  <input
-                    type="checkbox"
-                    aria-label={`Select ${sender.displayName}`}
-                    checked={selected.has(sender.id)}
-                    disabled={pendingOp}
-                    onChange={(e) => toggleOne(sender.id, e.target.checked)}
-                  />
-                </td>
-                <td className="max-w-[180px] px-3 py-3 font-medium">
-                  <div className="flex min-w-0 items-center gap-2">
+            {groupByDomain
+              ? domainGroups.map((group) => (
+                <tr key={group.domain} className="border-t border-border hover:bg-muted/30">
+                  <td className="w-10 px-3 py-3">
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${group.domain}`}
+                      checked={group.senderIds.every((id) => selected.has(id))}
+                      disabled={pendingOp}
+                      onChange={(e) => toggleGroup(group.senderIds, e.target.checked)}
+                    />
+                  </td>
+                  <td className="px-3 py-3 font-medium">{group.domain}</td>
+                  <td className="px-3 py-3">
+                    <span className={`inline-flex rounded-full px-2 py-0.5 text-xs ${categoryBadgeClass(group.category)}`}>
+                      {group.category}
+                    </span>
+                  </td>
+                  <td className="w-20 px-3 py-3 text-right">{group.emailCount}</td>
+                  <td className="w-28 whitespace-nowrap px-3 py-3 text-muted-foreground">{formatDate(group.lastReceivedAt)}</td>
+                  <td className="w-24 px-3 py-3">
                     <Link
-                      href={`/senders/${sender.id}`}
-                      className="block truncate text-blue-600 hover:underline dark:text-blue-400"
-                      title={sender.displayName}
+                      href={`/senders/${group.exampleSenderId}?returnTo=${returnTo}`}
+                      className="text-xs text-blue-600 hover:underline dark:text-blue-400"
                     >
-                      {sender.displayName}
+                      Open
                     </Link>
-                    {sender.blockedAt && (
-                      <span className="shrink-0 rounded-full bg-red-100 px-1.5 py-0.5 text-xs font-medium text-red-700 dark:bg-red-900 dark:text-red-300">
-                        Blocked
-                      </span>
-                    )}
-                  </div>
-                </td>
-                <td className="max-w-[220px] px-3 py-3 text-muted-foreground">
-                  <span className="block truncate" title={sender.email}>{sender.email}</span>
-                </td>
-                <td className="w-20 px-3 py-3 text-right">{Number(sender.emailCount ?? 0)}</td>
-                <td className="w-28 whitespace-nowrap px-3 py-3 text-muted-foreground">
-                  {formatDate(sender.lastReceivedAt)}
-                </td>
-                <td className="w-24 px-3 py-3">
-                  <div className="flex items-center gap-0.5">
-                    {sender.unsubscribedAt ? (
-                      <span className="inline-flex items-center rounded p-1 text-green-600" title="Unsubscribed">
-                        <Check size={15} />
-                      </span>
-                    ) : sender.canUnsubscribe ? (
+                  </td>
+                </tr>
+              ))
+              : visibleSenders.map((sender) => (
+                <tr key={sender.id} className="border-t border-border hover:bg-muted/30">
+                  <td className="w-10 px-3 py-3">
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${sender.displayName}`}
+                      checked={selected.has(sender.id)}
+                      disabled={pendingOp}
+                      onChange={(e) => toggleOne(sender.id, e.target.checked)}
+                    />
+                  </td>
+                  <td className="max-w-[180px] px-3 py-3 font-medium">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <Link
+                        href={`/senders/${sender.id}?returnTo=${returnTo}`}
+                        className="block truncate text-blue-600 hover:underline dark:text-blue-400"
+                        title={sender.displayName}
+                      >
+                        {sender.displayName}
+                      </Link>
+                      <span className={`h-2.5 w-2.5 rounded-full ${scoreDotClass(sender.keepScore ?? 0)}`} title={`Keep score ${sender.keepScore ?? 0}`} />
+                      {sender.blockedAt && (
+                        <span className="shrink-0 rounded-full bg-red-100 px-1.5 py-0.5 text-xs font-medium text-red-700 dark:bg-red-900 dark:text-red-300">
+                          Blocked
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="max-w-[220px] px-3 py-3 text-muted-foreground">
+                    <span className="block truncate" title={sender.email}>{sender.email}</span>
+                  </td>
+                  <td className="px-3 py-3">
+                    <span className={`inline-flex rounded-full px-2 py-0.5 text-xs ${categoryBadgeClass(sender.category)}`}>
+                      {sender.category}
+                    </span>
+                  </td>
+                  <td className="w-20 px-3 py-3 text-right">{Number(sender.emailCount ?? 0)}</td>
+                  <td className="w-28 whitespace-nowrap px-3 py-3 text-muted-foreground">
+                    {formatDate(sender.lastReceivedAt)}
+                  </td>
+                  <td className="w-24 px-3 py-3">
+                    <div className="flex items-center gap-0.5">
+                      {sender.unsubscribedAt ? (
+                        <span className="inline-flex items-center rounded p-1 text-green-600" title="Unsubscribed">
+                          <Check size={15} />
+                        </span>
+                      ) : sender.canUnsubscribe ? (
+                        <button
+                          type="button"
+                          onClick={() => onUnsubscribe(sender)}
+                          disabled={unsubPending.has(sender.id)}
+                          className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-accent disabled:opacity-50"
+                          title="Unsubscribe"
+                        >
+                          <MailX size={15} />
+                        </button>
+                      ) : null}
                       <button
                         type="button"
-                        onClick={() => onUnsubscribe(sender)}
-                        disabled={unsubPending.has(sender.id)}
+                        onClick={() => onBlock(sender)}
+                        disabled={blockPending.has(sender.id) || !!sender.blockedAt}
                         className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-accent disabled:opacity-50"
-                        title="Unsubscribe"
+                        title={sender.blockedAt ? 'Already blocked' : 'Block sender'}
                       >
-                        <MailX size={15} />
+                        <Ban size={15} />
                       </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      onClick={() => onBlock(sender)}
-                      disabled={blockPending.has(sender.id) || !!sender.blockedAt}
-                      className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-accent disabled:opacity-50"
-                      title={sender.blockedAt ? 'Already blocked' : 'Block sender'}
-                    >
-                      <Ban size={15} />
-                    </button>
-                    <button
-                      type="button"
-                      title={`Trash all emails from ${sender.email}`}
-                      disabled={pendingOp}
-                      onClick={() => setTrashDialogSender(sender)}
-                      className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-red-50 hover:text-red-600 disabled:opacity-50 dark:hover:bg-red-950"
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-            {senders.length === 0 && (
+                      <button
+                        type="button"
+                        title={`Trash all emails from ${sender.email}`}
+                        disabled={pendingOp}
+                        onClick={() => setTrashDialogSender(sender)}
+                        className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-red-50 hover:text-red-600 disabled:opacity-50 dark:hover:bg-red-950"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            {visibleSenders.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-muted-foreground">
+                <td colSpan={groupByDomain ? 6 : 7} className="px-4 py-6 text-center text-muted-foreground">
                   {noResults}
                 </td>
               </tr>
@@ -525,12 +729,11 @@ export default function SenderGroupsTable({
         </table>
       </div>
 
-      {/* Mobile card list */}
       <div className="flex flex-col gap-2 sm:hidden">
-        {senders.length === 0 ? (
+        {visibleSenders.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">{noResults}</p>
         ) : (
-          senders.map((sender) => (
+          visibleSenders.map((sender) => (
             <div key={sender.id} className="rounded-lg border border-border p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
@@ -544,16 +747,12 @@ export default function SenderGroupsTable({
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5">
                       <Link
-                        href={`/senders/${sender.id}`}
+                        href={`/senders/${sender.id}?returnTo=${returnTo}`}
                         className="truncate font-medium text-blue-600 hover:underline dark:text-blue-400"
                       >
                         {sender.displayName}
                       </Link>
-                      {sender.blockedAt && (
-                        <span className="shrink-0 rounded-full bg-red-100 px-1.5 py-0.5 text-xs font-medium text-red-700 dark:bg-red-900 dark:text-red-300">
-                          Blocked
-                        </span>
-                      )}
+                      <span className={`h-2.5 w-2.5 rounded-full ${scoreDotClass(sender.keepScore ?? 0)}`} />
                     </div>
                     <p className="truncate text-xs text-muted-foreground">{sender.email}</p>
                   </div>
@@ -594,7 +793,10 @@ export default function SenderGroupsTable({
                   </button>
                 </div>
               </div>
-              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span className={`inline-flex rounded-full px-2 py-0.5 ${categoryBadgeClass(sender.category)}`}>
+                  {sender.category}
+                </span>
                 <span>{sender.emailCount} emails</span>
                 {sender.lastReceivedAt && (
                   <span>Last: {formatDate(sender.lastReceivedAt)}</span>

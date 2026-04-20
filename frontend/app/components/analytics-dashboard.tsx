@@ -58,7 +58,7 @@ function formatDay(v: string): string {
   return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
 }
 
-export function AnalyticsDashboard() {
+export function AnalyticsDashboard({ account }: { account?: string }) {
   const [topSenders, setTopSenders] = useState<AnalyticsTopSender[]>([]);
   const [timeline, setTimeline] = useState<AnalyticsTimelineEntry[]>([]);
   const [labels, setLabels] = useState<AnalyticsLabelEntry[]>([]);
@@ -68,7 +68,7 @@ export function AnalyticsDashboard() {
   useEffect(() => {
     if (!open) return;
     setLoading(true);
-    Promise.all([analyticsTopSenders(), analyticsTimeline(), analyticsLabels()])
+    Promise.all([analyticsTopSenders(account), analyticsTimeline(account), analyticsLabels(account)])
       .then(([ts, tl, lb]) => {
         setTopSenders(ts);
         setTimeline(tl);
@@ -76,7 +76,7 @@ export function AnalyticsDashboard() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [open]);
+  }, [open, account]);
 
   return (
     <div className="mt-6 rounded-lg border border-border">
@@ -85,7 +85,12 @@ export function AnalyticsDashboard() {
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-semibold hover:bg-accent"
       >
-        <span>Analytics</span>
+        <span className="flex min-w-0 flex-col">
+          <span>Analytics</span>
+          <span className="mt-0.5 truncate text-xs font-normal text-muted-foreground">
+            Showing: {account || 'All accounts'}
+          </span>
+        </span>
         <span className="text-muted-foreground">{open ? '▲' : '▼'}</span>
       </button>
 

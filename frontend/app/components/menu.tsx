@@ -15,9 +15,17 @@ import { ThemeToggle } from './theme-toggle';
 export function NavMenu() {
   const [open, setOpen] = useState(false);
   const pathname = usePathname();
+  const [account, setAccount] = useState<string | null>(null);
+  const withAccount = (href: string) => (account ? `${href}?account=${encodeURIComponent(account)}` : href);
 
   useEffect(() => {
     setOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    setAccount(params.get('account'));
   }, [pathname]);
 
   return (
@@ -34,21 +42,21 @@ export function NavMenu() {
         <SheetTitle>Menu</SheetTitle>
         <nav className="mt-4 flex flex-1 flex-col space-y-4">
           <Link
-            href="/inbox"
+            href={withAccount('/inbox')}
             className="flex items-center space-x-2 rounded p-2 text-foreground hover:bg-accent"
           >
             <Inbox size={20} />
             <span>Inbox Overview</span>
           </Link>
           <Link
-            href="/senders"
+            href={withAccount('/senders')}
             className="flex items-center space-x-2 rounded p-2 text-foreground hover:bg-accent"
           >
             <Users size={20} />
             <span>Sender Groups</span>
           </Link>
           <Link
-            href="/settings"
+            href={withAccount('/settings')}
             className="flex items-center space-x-2 rounded p-2 text-foreground hover:bg-accent"
           >
             <Settings size={20} />

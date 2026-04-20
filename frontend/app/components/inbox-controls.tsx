@@ -20,9 +20,11 @@ type SyncStatus = {
 export function InboxControls({
   connectUrl,
   backendUrl,
+  account,
 }: {
   connectUrl: string;
   backendUrl: string;
+  account?: string;
 }) {
   const router = useRouter();
   const [syncPending, setSyncPending] = useState(false);
@@ -92,8 +94,9 @@ export function InboxControls({
     setSyncPending(true);
     startPolling();
 
+    const accountQuery = account ? `?account=${encodeURIComponent(account)}` : '';
     try {
-      const response = await fetch(`${backendUrl}/api/go/sync/gmail`, {
+      const response = await fetch(`${backendUrl}/api/go/sync/gmail${accountQuery}`, {
         method: 'POST',
       });
       if (!response.ok) {

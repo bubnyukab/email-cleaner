@@ -28,6 +28,10 @@ type SenderSummary struct {
 	ID             int        `json:"id"`
 	Email          string     `json:"email"`
 	DisplayName    string     `json:"displayName"`
+	Domain         string     `json:"domain"`
+	Category       string     `json:"category"`
+	KeepScore      int        `json:"keepScore"`
+	HasInbox       bool       `json:"hasInbox"`
 	EmailCount     int        `json:"emailCount"`
 	ThreadCount    int        `json:"threadCount"`
 	TotalSizeBytes int64      `json:"totalSizeBytes"`

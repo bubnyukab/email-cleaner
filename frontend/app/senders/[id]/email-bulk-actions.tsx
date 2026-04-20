@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
 
-export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmail[] }) {
+export default function SenderEmailsBulkActions({ emails, account }: { emails: SenderEmail[]; account?: string }) {
   const router = useRouter();
   const [search, setSearch] = useState('');
   const filteredEmails = useMemo(() => {
@@ -59,7 +59,7 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
     setPendingOp('trash');
     const trashedIds = Array.from(selected);
     try {
-      const result = await bulkTrashEmails(trashedIds);
+      const result = await bulkTrashEmails(trashedIds, account);
       setSelected(new Set());
       router.refresh();
 
@@ -68,7 +68,7 @@ export default function SenderEmailsBulkActions({ emails }: { emails: SenderEmai
           label: 'Undo',
           onClick: async () => {
             try {
-              await bulkUntrashEmails(trashedIds);
+              await bulkUntrashEmails(trashedIds, account);
               toast.success('Restored emails from trash');
               router.refresh();
             } catch {
