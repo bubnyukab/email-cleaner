@@ -113,3 +113,21 @@ type LabelCount struct {
 	Label string `json:"label"`
 	Count int    `json:"count"`
 }
+
+type MessageData struct {
+	GmailMessageID    string
+	GmailThreadID     string
+	SenderEmail       string
+	DisplayName       string
+	Subject           string
+	Snippet           string
+	BodyText          string
+	BodyHTML          string
+	LabelIDs          string
+	ListUnsubscribe   string
+	UnsubscribeURL    string
+	UnsubscribeMailto string
+	ReceivedAt        *time.Time
+	SizeEstimate      int64
+	AccountID         int
+}

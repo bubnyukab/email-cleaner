@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,9 +20,9 @@ import (
 	"api/gmailutil"
 	"api/models"
 	"api/store"
+	"api/syncer"
 
 	"github.com/gorilla/mux"
-	"github.com/lib/pq"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
@@ -31,24 +30,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// api is the central server struct. All HTTP handlers are methods on it.
-// Type aliases make it easy to migrate to models package incrementally.
-type (
-	syncStatus            = models.SyncStatus
-	inboxStats            = models.InboxStats
-	senderSummary         = models.SenderSummary
-	senderEmail           = models.SenderEmail
-	paginatedSenderEmails = models.PaginatedSenderEmails
-)
-
 type api struct {
 	store       store.Store
-	db          *sql.DB // retained for sync methods until #3
+	syncer      syncer.Syncer
 	oauthConfig *oauth2.Config
 	stateStore  map[string]time.Time
 	stateMu     sync.Mutex
-	syncMu      sync.Mutex
-	syncStatus  syncStatus
 }
 
 func main() {
@@ -73,9 +60,11 @@ func main() {
 		Endpoint:     google.Endpoint,
 	}
 
+	st := store.New(db)
+	gs := syncer.New(st, oauthConfig)
 	app := &api{
-		store:       store.New(db),
-		db:          db,
+		store:       st,
+		syncer:      gs,
 		oauthConfig: oauthConfig,
 		stateStore:  map[string]time.Time{},
 	}
@@ -106,7 +95,7 @@ func main() {
 	router.HandleFunc("/api/go/preferences", app.putPreferences).Methods("PUT")
 
 	// Start background scheduled sync watcher.
-	go app.runScheduledSync()
+	go gs.RunScheduled()
 
 	log.Fatal(http.ListenAndServe(":8080", enableCORS(jsonContentTypeMiddleware(router))))
 }
@@ -269,454 +258,38 @@ func (a *api) googleAuthCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) syncGmail(w http.ResponseWriter, r *http.Request) {
-	a.syncMu.Lock()
-	if a.syncStatus.Running {
-		a.syncMu.Unlock()
+	if a.syncer.IsRunning() {
 		http.Error(w, `{"error":"sync already running"}`, http.StatusConflict)
 		return
 	}
-	a.syncStatus = syncStatus{
-		Running:   true,
-		StartedAt: time.Now(),
-	}
-	a.syncMu.Unlock()
-
-	defer func() {
-		a.syncMu.Lock()
-		a.syncStatus.Running = false
-		a.syncStatus.FinishedAt = time.Now()
-		a.syncMu.Unlock()
-	}()
 
 	requestedAccount := strings.TrimSpace(r.URL.Query().Get("account"))
-	accountEmail, token, err := a.loadTokenForAccount(requestedAccount)
-	if err != nil {
-		a.setSyncError(err.Error())
-		http.Error(w, `{"error":"connect Gmail first via /api/go/auth/google/start"}`, http.StatusBadRequest)
-		return
-	}
-	a.setSyncConnectedAccount(accountEmail)
-
-	syncAccountID, _ := a.resolveAccountID(accountEmail)
-
-	// Backfill the new cache table from already-stored rows so we can skip
-	// older messages immediately after deploying this change.
-	_, err = a.db.Exec(`
-		INSERT INTO gmail_message_cache (gmail_message_id)
-		SELECT gmail_message_id FROM sender_emails
-		ON CONFLICT(gmail_message_id) DO NOTHING
-	`)
-	if err != nil {
-		a.setSyncError(err.Error())
-		http.Error(w, `{"error":"failed bootstrapping message cache"}`, http.StatusBadGateway)
-		return
-	}
-
-	ctx := context.Background()
-	tokenSource := a.oauthConfig.TokenSource(ctx, token)
-	currentToken, err := tokenSource.Token()
-	if err == nil {
-		_, _ = a.db.Exec(`
-			UPDATE gmail_accounts
-			SET access_token = $1,
-			    refresh_token = COALESCE($2, refresh_token),
-			    token_expiry = $3,
-			    updated_at = NOW()
-			WHERE email = $4
-		`, currentToken.AccessToken, currentToken.RefreshToken, currentToken.Expiry, accountEmail)
-	}
-
-	service, err := gmail.NewService(ctx, option.WithTokenSource(tokenSource))
-	if err != nil {
-		a.setSyncError(err.Error())
-		http.Error(w, `{"error":"failed creating gmail service"}`, http.StatusBadGateway)
-		return
-	}
-
-	// Get the exact total message count from Gmail profile so the dashboard
-	// number matches what Gmail shows.
-	profile, err := gmailutil.WithRetry(func() (*gmail.Profile, error) {
-		return service.Users.GetProfile("me").Do()
-	})
-	if err == nil && profile.MessagesTotal > 0 {
-		a.syncMu.Lock()
-		a.syncStatus.Total = int64(profile.MessagesTotal)
-		a.syncMu.Unlock()
-	}
-
-	inserted := 0
-	failed := 0
-	fetched := 0
-	pageToken := ""
-	allScannedIDs := make([]string, 0, 10000)
-	messageIDs := make(chan string, 2000)
-	var workers sync.WaitGroup
-	workerCount := runtime.NumCPU() * 2
-	if workerCount < 2 {
-		workerCount = 2
-	}
-	if workerCount > 8 {
-		workerCount = 8
-	}
-
-	for i := 0; i < workerCount; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for id := range messageIDs {
-				msg, err := gmailutil.WithRetry(func() (*gmail.Message, error) {
-					return service.Users.Messages.Get("me", id).Format("full").Do()
-				})
-				if err != nil {
-					a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
-					continue
-				}
-
-				ok, storeErr := a.storeGmailMessage(msg, syncAccountID)
-				if storeErr != nil {
-					a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
-					continue
-				}
-
-				// Mark as cached even if we couldn't associate the sender, so we
-				// don't fetch it again on the next sync run.
-				if err := a.markGmailMessageCached(msg.Id); err != nil {
-					a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
-					continue
-				}
-
-				if ok {
-					a.bumpSyncProgress(0, 0, 0, 1, 1, 0)
-				} else {
-					a.bumpSyncProgress(0, 0, 0, 1, 0, 0)
-				}
-			}
-		}()
-	}
-
-	for {
-		// List all messages without a query filter so the total matches Gmail's
-		// reported messagesTotal from GetProfile.
-		req := service.Users.Messages.List("me").MaxResults(500)
-		if pageToken != "" {
-			req = req.PageToken(pageToken)
-		}
-
-		listResp, err := gmailutil.WithRetry(func() (*gmail.ListMessagesResponse, error) {
-			return req.Do()
-		})
-		if err != nil {
-			a.setSyncError(err.Error())
-			close(messageIDs)
-			workers.Wait()
-			http.Error(w, `{"error":"failed listing messages after retries"}`, http.StatusBadGateway)
+	if err := a.syncer.Run(r.Context(), requestedAccount); err != nil {
+		msg := err.Error()
+		if msg == "sync already running" {
+			http.Error(w, `{"error":"sync already running"}`, http.StatusConflict)
 			return
 		}
-
-		// ResultSizeEstimate is unreliable; we already set the real total
-		// from GetProfile above.
-
-		ids := make([]string, 0, len(listResp.Messages))
-		for _, m := range listResp.Messages {
-			ids = append(ids, m.Id)
-		}
-		allScannedIDs = append(allScannedIDs, ids...)
-		fetched += len(ids)
-
-		if len(ids) > 0 {
-			// Skip message bodies we've already processed.
-			rows, err := a.db.Query(`
-				SELECT gmail_message_id
-				FROM gmail_message_cache
-				WHERE gmail_message_id = ANY($1)
-			`, pq.Array(ids))
-			if err != nil {
-				a.setSyncError(err.Error())
-				close(messageIDs)
-				workers.Wait()
-				http.Error(w, `{"error":"failed querying message cache"}`, http.StatusBadGateway)
-				return
-			}
-
-			existing := make(map[string]struct{}, len(ids))
-			for rows.Next() {
-				var id string
-				if err := rows.Scan(&id); err != nil {
-					rows.Close()
-					a.setSyncError(err.Error())
-					close(messageIDs)
-					workers.Wait()
-					http.Error(w, `{"error":"failed reading message cache rows"}`, http.StatusBadGateway)
-					return
-				}
-				existing[id] = struct{}{}
-			}
-			rows.Close()
-
-			missing := make([]string, 0, len(ids))
-			for _, id := range ids {
-				if _, ok := existing[id]; !ok {
-					missing = append(missing, id)
-				}
-			}
-
-			// Checked: all ids in this Gmail page.
-			// Pending: ids that actually need full fetch + store.
-			a.bumpSyncProgress(0, int64(len(ids)), int64(len(missing)), 0, 0, 0)
-
-			for _, id := range missing {
-				messageIDs <- id
-			}
-		}
-
-		if listResp.NextPageToken == "" {
-			break
-		}
-		pageToken = listResp.NextPageToken
-	}
-	close(messageIDs)
-	workers.Wait()
-
-	// Keep local counts aligned with the latest scanned snapshot for this account.
-	if syncAccountID > 0 {
-		if err := a.reconcileScannedSnapshot(allScannedIDs, syncAccountID); err != nil {
-			a.setSyncError(err.Error())
-			http.Error(w, `{"error":"failed reconciling scanned snapshot"}`, http.StatusBadGateway)
+		if strings.Contains(msg, "connect Gmail") {
+			http.Error(w, `{"error":"connect Gmail first via /api/go/auth/google/start"}`, http.StatusBadRequest)
 			return
 		}
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, msg), http.StatusBadGateway)
+		return
 	}
 
-	// Keep the authoritative total from GetProfile; allScannedIDs may
-	// differ slightly if messages arrive or are deleted during the run.
-
-	a.syncMu.Lock()
-	inserted = a.syncStatus.Inserted
-	failed = a.syncStatus.Failed
-	a.syncMu.Unlock()
-
+	status := a.syncer.Status()
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":       true,
-		"connectedAs":   accountEmail,
-		"fetched":       fetched,
-		"insertedCount": inserted,
-		"failedCount":   failed,
+		"connectedAs":   status.ConnectedAs,
+		"fetched":       status.Checked,
+		"insertedCount": status.Inserted,
+		"failedCount":   status.Failed,
 	})
 }
 
 func (a *api) getSyncStatus(w http.ResponseWriter, r *http.Request) {
-	a.syncMu.Lock()
-	status := a.syncStatus
-	a.syncMu.Unlock()
-	json.NewEncoder(w).Encode(status)
-}
-
-
-func (a *api) setSyncConnectedAccount(email string) {
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	a.syncStatus.ConnectedAs = email
-}
-
-func (a *api) setSyncError(err string) {
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	a.syncStatus.LastError = err
-}
-
-func (a *api) bumpSyncProgress(
-	totalEstimate int64,
-	checkedDelta int64,
-	pendingTotalDelta int64,
-	scannedDelta int,
-	insertedDelta int,
-	failedDelta int,
-) {
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	if totalEstimate > a.syncStatus.Total {
-		a.syncStatus.Total = totalEstimate
-	}
-	a.syncStatus.Checked += checkedDelta
-	a.syncStatus.PendingTotal += pendingTotalDelta
-	a.syncStatus.Scanned += scannedDelta
-	a.syncStatus.Inserted += insertedDelta
-	a.syncStatus.Failed += failedDelta
-}
-
-func (a *api) markGmailMessageCached(messageID string) error {
-	_, err := a.db.Exec(`
-		INSERT INTO gmail_message_cache (gmail_message_id)
-		VALUES ($1)
-		ON CONFLICT(gmail_message_id) DO NOTHING
-	`, messageID)
-	return err
-}
-
-func (a *api) reconcileScannedSnapshot(scannedIDs []string, accountID int) error {
-	tx, err := a.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if len(scannedIDs) == 0 {
-		if _, err := tx.Exec(`DELETE FROM sender_emails WHERE gmail_account_id = $1`, accountID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`
-			DELETE FROM senders s
-			WHERE s.gmail_account_id = $1
-			  AND NOT EXISTS (
-				SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id
-			  )
-		`, accountID); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-
-	if _, err := tx.Exec(`
-		DELETE FROM sender_emails
-		WHERE gmail_account_id = $2
-		  AND gmail_message_id <> ALL($1)
-	`, pq.Array(scannedIDs), accountID); err != nil {
-		return err
-	}
-
-	if _, err := tx.Exec(`
-		DELETE FROM senders s
-		WHERE s.gmail_account_id = $1
-		  AND NOT EXISTS (
-			SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id
-		  )
-	`, accountID); err != nil {
-		return err
-	}
-
-	return tx.Commit()
-}
-
-func (a *api) reconcileLegacyScannedSnapshot(scannedIDs []string) error {
-	tx, err := a.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if len(scannedIDs) == 0 {
-		if _, err := tx.Exec(`DELETE FROM sender_emails`); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM senders`); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-
-	if _, err := tx.Exec(`
-		DELETE FROM sender_emails
-		WHERE gmail_message_id <> ALL($1)
-	`, pq.Array(scannedIDs)); err != nil {
-		return err
-	}
-
-	if _, err := tx.Exec(`
-		DELETE FROM senders s
-		WHERE NOT EXISTS (
-			SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id
-		)
-	`); err != nil {
-		return err
-	}
-
-	return tx.Commit()
-}
-
-func (a *api) storeGmailMessage(msg *gmail.Message, accountID ...int) (bool, error) {
-	fromHeader := gmailutil.HeaderValue(msg.Payload.Headers, "From")
-	subject := gmailutil.HeaderValue(msg.Payload.Headers, "Subject")
-	receivedAt := gmailutil.ParseDate(gmailutil.HeaderValue(msg.Payload.Headers, "Date"))
-	displayName, senderEmail := gmailutil.ParseFromHeader(fromHeader)
-	if senderEmail == "" {
-		return false, nil
-	}
-
-	bodyText := gmailutil.ExtractPlainBody(msg.Payload)
-	bodyHTML := gmailutil.ExtractHTMLBody(msg.Payload)
-	labelIDs := strings.Join(msg.LabelIds, ",")
-	listUnsub := gmailutil.HeaderValue(msg.Payload.Headers, "List-Unsubscribe")
-
-	tx, err := a.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-
-	var senderID int
-	err = tx.QueryRow(`
-		INSERT INTO senders (email, display_name)
-		VALUES ($1, $2)
-		ON CONFLICT(email)
-		DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, senders.display_name)
-		RETURNING id
-	`, senderEmail, displayName).Scan(&senderID)
-	if err != nil {
-		return false, err
-	}
-
-	// If this message has an unsubscribe header and the sender doesn't yet,
-	// parse and store the URL/mailto for one-click unsubscribe.
-	if listUnsub != "" {
-		unsubURL, unsubMailto := gmailutil.ParseListUnsubscribe(listUnsub)
-		if unsubURL != "" || unsubMailto != "" {
-			_, _ = tx.Exec(`
-				UPDATE senders
-				SET unsubscribe_url = COALESCE(senders.unsubscribe_url, $1),
-				    unsubscribe_mailto = COALESCE(senders.unsubscribe_mailto, $2)
-				WHERE id = $3 AND (senders.unsubscribe_url IS NULL AND senders.unsubscribe_mailto IS NULL)
-			`, nullIfEmpty(unsubURL), nullIfEmpty(unsubMailto), senderID)
-		}
-	}
-
-	var acctID interface{}
-	if len(accountID) > 0 && accountID[0] > 0 {
-		acctID = accountID[0]
-	}
-
-	// Also stamp the sender row with this account ID if not already set.
-	if acctID != nil {
-		_, _ = tx.Exec(`UPDATE senders SET gmail_account_id = $1 WHERE id = $2 AND gmail_account_id IS NULL`, acctID, senderID)
-	}
-
-	result, err := tx.Exec(`
-		INSERT INTO sender_emails (
-			gmail_message_id,
-			gmail_thread_id,
-			sender_id,
-			subject,
-			snippet,
-			body_text,
-			body_html,
-			received_at,
-			label_ids,
-			size_bytes,
-			list_unsubscribe,
-			gmail_account_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		ON CONFLICT(gmail_message_id) DO NOTHING
-	`, msg.Id, msg.ThreadId, senderID, subject, msg.Snippet, bodyText, nullIfEmpty(bodyHTML), receivedAt, labelIDs, msg.SizeEstimate, nullIfEmpty(listUnsub), acctID)
-	if err != nil {
-		return false, err
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return rows > 0, nil
+	json.NewEncoder(w).Encode(a.syncer.Status())
 }
 
 func (a *api) getInboxStats(w http.ResponseWriter, r *http.Request) {
@@ -1305,7 +878,7 @@ func (a *api) bulkUntrashEmails(w http.ResponseWriter, r *http.Request) {
 
 	// Re-insert into cache so the next sync sees them as existing.
 	for _, id := range succeeded {
-		_ = a.markGmailMessageCached(id)
+		_ = a.store.MarkMessageCached(id)
 	}
 
 	json.NewEncoder(w).Encode(map[string]any{
@@ -1557,224 +1130,3 @@ func (a *api) putPreferences(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"success": true})
 }
 
-// ── Scheduled sync ────────────────────────────────────────────────────────────
-
-func (a *api) getSyncInterval() time.Duration {
-	val, err := a.store.GetPreferenceValue("sync_interval")
-	if err != nil {
-		return 0
-	}
-	switch val {
-	case "1h":
-		return time.Hour
-	case "6h":
-		return 6 * time.Hour
-	case "24h", "daily":
-		return 24 * time.Hour
-	default:
-		return 0
-	}
-}
-
-func (a *api) runScheduledSync() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		interval := a.getSyncInterval()
-		if interval == 0 {
-			a.syncMu.Lock()
-			a.syncStatus.NextSyncAt = nil
-			a.syncMu.Unlock()
-			continue
-		}
-
-		a.syncMu.Lock()
-		lastFinished := a.syncStatus.FinishedAt
-		running := a.syncStatus.Running
-		a.syncMu.Unlock()
-
-		nextAt := lastFinished.Add(interval)
-		a.syncMu.Lock()
-		a.syncStatus.NextSyncAt = &nextAt
-		a.syncMu.Unlock()
-
-		if !running && !lastFinished.IsZero() && time.Now().After(nextAt) {
-			log.Printf("scheduled sync: triggering automatic sync")
-			a.triggerSync()
-		}
-	}
-}
-
-func (a *api) triggerSync() {
-	a.syncMu.Lock()
-	if a.syncStatus.Running {
-		a.syncMu.Unlock()
-		return
-	}
-	a.syncStatus = syncStatus{
-		Running:   true,
-		StartedAt: time.Now(),
-	}
-	a.syncMu.Unlock()
-
-	go func() {
-		defer func() {
-			a.syncMu.Lock()
-			a.syncStatus.Running = false
-			a.syncStatus.FinishedAt = time.Now()
-			a.syncMu.Unlock()
-		}()
-
-		accountEmail, token, err := a.loadPrimaryToken()
-		if err != nil {
-			a.setSyncError(err.Error())
-			return
-		}
-		a.setSyncConnectedAccount(accountEmail)
-		syncAccountID, _ := a.resolveAccountID(accountEmail)
-
-		_, _ = a.db.Exec(`
-			INSERT INTO gmail_message_cache (gmail_message_id)
-			SELECT gmail_message_id FROM sender_emails
-			ON CONFLICT(gmail_message_id) DO NOTHING
-		`)
-
-		ctx := context.Background()
-		tokenSource := a.oauthConfig.TokenSource(ctx, token)
-		service, err := gmail.NewService(ctx, option.WithTokenSource(tokenSource))
-		if err != nil {
-			a.setSyncError(err.Error())
-			return
-		}
-
-		profile, err := gmailutil.WithRetry(func() (*gmail.Profile, error) {
-			return service.Users.GetProfile("me").Do()
-		})
-		if err == nil && profile.MessagesTotal > 0 {
-			a.syncMu.Lock()
-			a.syncStatus.Total = int64(profile.MessagesTotal)
-			a.syncMu.Unlock()
-		}
-
-		pageToken := ""
-		allScannedIDs := make([]string, 0, 10000)
-		messageIDs := make(chan string, 2000)
-		var workers sync.WaitGroup
-		workerCount := runtime.NumCPU() * 2
-		if workerCount < 2 {
-			workerCount = 2
-		}
-		if workerCount > 8 {
-			workerCount = 8
-		}
-
-		for i := 0; i < workerCount; i++ {
-			workers.Add(1)
-			go func() {
-				defer workers.Done()
-				for id := range messageIDs {
-					msg, err := gmailutil.WithRetry(func() (*gmail.Message, error) {
-						return service.Users.Messages.Get("me", id).Format("full").Do()
-					})
-					if err != nil {
-						a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
-						continue
-					}
-					ok, storeErr := a.storeGmailMessage(msg, syncAccountID)
-					if storeErr != nil {
-						a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
-						continue
-					}
-					if err := a.markGmailMessageCached(msg.Id); err != nil {
-						a.bumpSyncProgress(0, 0, 0, 1, 0, 1)
-						continue
-					}
-					if ok {
-						a.bumpSyncProgress(0, 0, 0, 1, 1, 0)
-					} else {
-						a.bumpSyncProgress(0, 0, 0, 1, 0, 0)
-					}
-				}
-			}()
-		}
-
-		for {
-			req := service.Users.Messages.List("me").MaxResults(500)
-			if pageToken != "" {
-				req = req.PageToken(pageToken)
-			}
-			listResp, err := gmailutil.WithRetry(func() (*gmail.ListMessagesResponse, error) {
-				return req.Do()
-			})
-			if err != nil {
-				a.setSyncError(err.Error())
-				close(messageIDs)
-				workers.Wait()
-				return
-			}
-
-			ids := make([]string, 0, len(listResp.Messages))
-			for _, m := range listResp.Messages {
-				ids = append(ids, m.Id)
-			}
-			allScannedIDs = append(allScannedIDs, ids...)
-
-			if len(ids) > 0 {
-				rows, err := a.db.Query(`
-					SELECT gmail_message_id FROM gmail_message_cache
-					WHERE gmail_message_id = ANY($1)
-				`, pq.Array(ids))
-				if err != nil {
-					a.setSyncError(err.Error())
-					close(messageIDs)
-					workers.Wait()
-					return
-				}
-				existing := make(map[string]struct{}, len(ids))
-				for rows.Next() {
-					var id string
-					if err := rows.Scan(&id); err != nil {
-						rows.Close()
-						a.setSyncError(err.Error())
-						close(messageIDs)
-						workers.Wait()
-						return
-					}
-					existing[id] = struct{}{}
-				}
-				rows.Close()
-
-				missing := make([]string, 0, len(ids))
-				for _, id := range ids {
-					if _, ok := existing[id]; !ok {
-						missing = append(missing, id)
-					}
-				}
-				a.bumpSyncProgress(0, int64(len(ids)), int64(len(missing)), 0, 0, 0)
-				for _, id := range missing {
-					messageIDs <- id
-				}
-			}
-
-			if listResp.NextPageToken == "" {
-				break
-			}
-			pageToken = listResp.NextPageToken
-		}
-		close(messageIDs)
-		workers.Wait()
-
-		if syncAccountID > 0 {
-			if err := a.reconcileScannedSnapshot(allScannedIDs, syncAccountID); err != nil {
-				a.setSyncError(err.Error())
-			}
-		} else {
-			// Backwards compatibility fallback if account id cannot be resolved.
-			if err := a.reconcileLegacyScannedSnapshot(allScannedIDs); err != nil {
-				a.setSyncError(err.Error())
-			}
-		}
-		log.Printf("scheduled sync completed: inserted=%d failed=%d", a.syncStatus.Inserted, a.syncStatus.Failed)
-	}()
-}

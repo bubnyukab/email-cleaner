@@ -59,6 +59,13 @@ type Store interface {
 	UpsertPreferences(prefs map[string]string) error
 	GetPreferenceValue(key string) (string, error)
 
+	// Sync writes
+	StoreMessage(msg models.MessageData) (bool, error)
+	MarkMessageCached(messageID string) error
+	BootstrapMessageCache() error
+	FilterUncachedIDs(ids []string) ([]string, error)
+	ReconcileSnapshot(scannedIDs []string, accountID int) error
+
 	// Transactions
 	WithTx(fn func(Store) error) error
 }
@@ -775,4 +782,193 @@ func (s *PostgresStore) GetPreferenceValue(key string) (string, error) {
 	var val string
 	err := s.db.QueryRow(`SELECT value FROM user_preferences WHERE key = $1`, key).Scan(&val)
 	return val, err
+}
+
+// ── Sync writes ───────────────────────────────────────────────────────────────
+
+func (s *PostgresStore) StoreMessage(msg models.MessageData) (bool, error) {
+	if msg.SenderEmail == "" {
+		return false, nil
+	}
+
+	tx, err := s.rawDB.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var senderID int
+	err = tx.QueryRow(`
+		INSERT INTO senders (email, display_name)
+		VALUES ($1, $2)
+		ON CONFLICT(email)
+		DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, senders.display_name)
+		RETURNING id
+	`, msg.SenderEmail, msg.DisplayName).Scan(&senderID)
+	if err != nil {
+		return false, err
+	}
+
+	if msg.UnsubscribeURL != "" || msg.UnsubscribeMailto != "" {
+		_, _ = tx.Exec(`
+			UPDATE senders
+			SET unsubscribe_url = COALESCE(senders.unsubscribe_url, $1),
+			    unsubscribe_mailto = COALESCE(senders.unsubscribe_mailto, $2)
+			WHERE id = $3 AND (senders.unsubscribe_url IS NULL AND senders.unsubscribe_mailto IS NULL)
+		`, nullStr(msg.UnsubscribeURL), nullStr(msg.UnsubscribeMailto), senderID)
+	}
+
+	if msg.AccountID > 0 {
+		_, _ = tx.Exec(`UPDATE senders SET gmail_account_id = $1 WHERE id = $2 AND gmail_account_id IS NULL`, msg.AccountID, senderID)
+	}
+
+	var acctID interface{}
+	if msg.AccountID > 0 {
+		acctID = msg.AccountID
+	}
+
+	result, err := tx.Exec(`
+		INSERT INTO sender_emails (
+			gmail_message_id, gmail_thread_id, sender_id, subject, snippet,
+			body_text, body_html, received_at, label_ids, size_bytes, list_unsubscribe, gmail_account_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT(gmail_message_id) DO NOTHING
+	`, msg.GmailMessageID, msg.GmailThreadID, senderID, msg.Subject, msg.Snippet,
+		msg.BodyText, nullStr(msg.BodyHTML), msg.ReceivedAt, msg.LabelIDs,
+		msg.SizeEstimate, nullStr(msg.ListUnsubscribe), acctID)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, tx.Commit()
+}
+
+func (s *PostgresStore) MarkMessageCached(messageID string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO gmail_message_cache (gmail_message_id)
+		VALUES ($1)
+		ON CONFLICT(gmail_message_id) DO NOTHING
+	`, messageID)
+	return err
+}
+
+func (s *PostgresStore) BootstrapMessageCache() error {
+	_, err := s.db.Exec(`
+		INSERT INTO gmail_message_cache (gmail_message_id)
+		SELECT gmail_message_id FROM sender_emails
+		ON CONFLICT(gmail_message_id) DO NOTHING
+	`)
+	return err
+}
+
+func (s *PostgresStore) FilterUncachedIDs(ids []string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT gmail_message_id FROM gmail_message_cache
+		WHERE gmail_message_id = ANY($1)
+	`, pq.Array(ids))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	existing := make(map[string]struct{}, len(ids))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		existing[id] = struct{}{}
+	}
+
+	missing := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := existing[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing, nil
+}
+
+func (s *PostgresStore) ReconcileSnapshot(scannedIDs []string, accountID int) error {
+	if accountID == 0 {
+		return s.reconcileSnapshotLegacy(scannedIDs)
+	}
+
+	tx, err := s.rawDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if len(scannedIDs) == 0 {
+		if _, err := tx.Exec(`DELETE FROM sender_emails WHERE gmail_account_id = $1`, accountID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			DELETE FROM senders s
+			WHERE s.gmail_account_id = $1
+			  AND NOT EXISTS (SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id)
+		`, accountID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if _, err := tx.Exec(`
+		DELETE FROM sender_emails
+		WHERE gmail_account_id = $2
+		  AND gmail_message_id <> ALL($1)
+	`, pq.Array(scannedIDs), accountID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM senders s
+		WHERE s.gmail_account_id = $1
+		  AND NOT EXISTS (SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id)
+	`, accountID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) reconcileSnapshotLegacy(scannedIDs []string) error {
+	tx, err := s.rawDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if len(scannedIDs) == 0 {
+		if _, err := tx.Exec(`DELETE FROM sender_emails`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM senders`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if _, err := tx.Exec(`
+		DELETE FROM sender_emails WHERE gmail_message_id <> ALL($1)
+	`, pq.Array(scannedIDs)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM senders s
+		WHERE NOT EXISTS (SELECT 1 FROM sender_emails e WHERE e.sender_id = s.id)
+	`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func nullStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
