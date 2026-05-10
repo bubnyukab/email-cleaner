@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"api/classify"
 	"api/gmailutil"
 	"api/models"
 
@@ -926,8 +927,8 @@ func (a *api) getSenders(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"failed reading sender rows"}`, http.StatusInternalServerError)
 			return
 		}
-		item.Category = classifySenderCategory(item.Email, hasListUnsubscribe, hasPromotions, hasSocial, hasUpdates, hasPersonal, item.HasInbox)
-		item.KeepScore = scoreSender(item.Category, item.HasInbox)
+		item.Category = classify.Category(item.Email, hasListUnsubscribe, hasPromotions, hasSocial, hasUpdates, hasPersonal, item.HasInbox)
+		item.KeepScore = classify.Score(item.Category, item.HasInbox)
 		items = append(items, item)
 	}
 	json.NewEncoder(w).Encode(items)
@@ -1076,8 +1077,8 @@ func (a *api) getSendersByDomain(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"failed reading sender domain rows"}`, http.StatusInternalServerError)
 			return
 		}
-		item.Category = classifySenderCategory(item.Domain, hasListUnsubscribe, hasPromotions, hasSocial, hasUpdates, hasPersonal, item.HasInbox)
-		item.KeepScore = scoreSender(item.Category, item.HasInbox)
+		item.Category = classify.Category(item.Domain, hasListUnsubscribe, hasPromotions, hasSocial, hasUpdates, hasPersonal, item.HasInbox)
+		item.KeepScore = classify.Score(item.Category, item.HasInbox)
 		item.SenderEmails = []string(senderEmails)
 		items = append(items, item)
 	}
@@ -1364,55 +1365,6 @@ func nullIfEmpty(s string) *string {
 	return &s
 }
 
-func classifySenderCategory(email string, hasListUnsubscribe bool, hasPromotions bool, hasSocial bool, hasUpdates bool, hasPersonal bool, hasInbox bool) string {
-	lower := strings.ToLower(email)
-	isNoReply := strings.Contains(lower, "noreply") ||
-		strings.Contains(lower, "no-reply") ||
-		strings.Contains(lower, "donotreply") ||
-		strings.Contains(lower, "notifications") ||
-		strings.Contains(lower, "alerts")
-
-	switch {
-	case hasListUnsubscribe:
-		return "Newsletter"
-	case hasPromotions:
-		return "Promotional"
-	case hasSocial:
-		return "Social"
-	case hasUpdates:
-		return "Notification"
-	case isNoReply:
-		return "No-reply"
-	case hasPersonal || hasInbox:
-		return "Personal"
-	default:
-		return "Other"
-	}
-}
-
-func scoreSender(category string, hasInbox bool) int {
-	score := 50
-	if hasInbox {
-		score += 20
-	}
-	switch category {
-	case "Personal":
-		score += 30
-	case "Newsletter":
-		score -= 30
-	case "No-reply":
-		score -= 20
-	case "Promotional":
-		score -= 20
-	}
-	if score < 0 {
-		return 0
-	}
-	if score > 100 {
-		return 100
-	}
-	return score
-}
 
 func (a *api) unsubscribeSender(w http.ResponseWriter, r *http.Request) {
 	senderID := mux.Vars(r)["senderId"]
