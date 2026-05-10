@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"database/sql"
+	"time"
+)
 
 type SyncStatus struct {
 	Running      bool       `json:"running"`
@@ -58,4 +61,55 @@ type PaginatedSenderEmails struct {
 	Total int           `json:"total"`
 	Page  int           `json:"page"`
 	Limit int           `json:"limit"`
+}
+
+type GetSendersParams struct {
+	AccountID int
+	Search    string
+	SortCol   string
+	SortOrder string
+	Labels    []string
+}
+
+type SenderDomainSummary struct {
+	Domain         string     `json:"domain"`
+	SenderCount    int        `json:"senderCount"`
+	EmailCount     int        `json:"emailCount"`
+	TotalSizeBytes int64      `json:"totalSizeBytes"`
+	LastReceivedAt *time.Time `json:"lastReceivedAt"`
+	HasInbox       bool       `json:"hasInbox"`
+	Category       string     `json:"category"`
+	KeepScore      int        `json:"keepScore"`
+	SenderEmails   []string   `json:"senderEmails"`
+}
+
+type Account struct {
+	ID        int       `json:"id"`
+	Email     string    `json:"email"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type SenderExportRow struct {
+	Email          string
+	DisplayName    string
+	EmailCount     int
+	ThreadCount    int
+	TotalSizeBytes int64
+	LastReceivedAt sql.NullTime
+	UnsubscribedAt sql.NullTime
+}
+
+type TopSenderAnalytic struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type EmailTimelinePoint struct {
+	Day   string `json:"day"`
+	Count int    `json:"count"`
+}
+
+type LabelCount struct {
+	Label string `json:"label"`
+	Count int    `json:"count"`
 }
