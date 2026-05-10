@@ -9,6 +9,7 @@ import {
   type SenderSortCol,
   type SenderSummary,
 } from '@/lib/go/client';
+import { applyQuickFilter, groupSendersByDomain, type DomainGroup, type QuickFilter } from '@/lib/senders';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { toast } from 'sonner';
@@ -25,7 +26,6 @@ import {
 } from '@/components/ui/dialog';
 
 type SortState = { col: SenderSortCol; order: 'asc' | 'desc' };
-type QuickFilter = 'newsletter' | 'noreply' | 'neverInbox' | 'oneEmail' | 'olderYear';
 
 const LABEL_DISPLAY: Record<string, string> = {
   INBOX: 'Inbox',
@@ -54,20 +54,6 @@ const CHIP_ORDER = [
   'SPAM',
   'STARRED',
 ];
-
-type DomainGroup = {
-  domain: string;
-  senderIds: number[];
-  senderCount: number;
-  emailCount: number;
-  threadCount: number;
-  totalSizeBytes: number;
-  lastReceivedAt?: string | null;
-  category: string;
-  keepScore: number;
-  hasInbox: boolean;
-  exampleSenderId: number;
-};
 
 function labelName(raw: string) {
   return LABEL_DISPLAY[raw] ?? raw;
@@ -247,62 +233,15 @@ export default function SenderGroupsTable({
     setSenders(initialSenders);
   }, [initialSenders]);
 
-  const visibleSenders = useMemo(() => {
-    if (!quickFilter) return senders;
-    const cutoff = new Date();
-    cutoff.setFullYear(cutoff.getFullYear() - 1);
-    return senders.filter((sender) => {
-      if (quickFilter === 'newsletter') return sender.category === 'Newsletter';
-      if (quickFilter === 'noreply') return sender.category === 'No-reply';
-      if (quickFilter === 'neverInbox') return !sender.hasInbox;
-      if (quickFilter === 'oneEmail') return (sender.emailCount ?? 0) === 1;
-      if (!sender.lastReceivedAt) return false;
-      return new Date(sender.lastReceivedAt) < cutoff;
-    });
-  }, [quickFilter, senders]);
+  const visibleSenders = useMemo(
+    () => applyQuickFilter(senders, quickFilter),
+    [quickFilter, senders],
+  );
 
-  const domainGroups = useMemo<DomainGroup[]>(() => {
-    const byDomain = new Map<string, DomainGroup>();
-    for (const sender of visibleSenders) {
-      const key = sender.domain || sender.email;
-      const existing = byDomain.get(key);
-      if (!existing) {
-        byDomain.set(key, {
-          domain: key,
-          senderIds: [sender.id],
-          senderCount: 1,
-          emailCount: sender.emailCount ?? 0,
-          threadCount: sender.threadCount ?? 0,
-          totalSizeBytes: sender.totalSizeBytes ?? 0,
-          lastReceivedAt: sender.lastReceivedAt ?? null,
-          category: sender.category,
-          keepScore: sender.keepScore ?? 0,
-          hasInbox: sender.hasInbox ?? false,
-          exampleSenderId: sender.id,
-        });
-        continue;
-      }
-      existing.senderIds.push(sender.id);
-      existing.senderCount += 1;
-      existing.emailCount += sender.emailCount ?? 0;
-      existing.threadCount += sender.threadCount ?? 0;
-      existing.totalSizeBytes += sender.totalSizeBytes ?? 0;
-      if (
-        sender.lastReceivedAt &&
-        (!existing.lastReceivedAt || new Date(sender.lastReceivedAt) > new Date(existing.lastReceivedAt))
-      ) {
-        existing.lastReceivedAt = sender.lastReceivedAt;
-      }
-      if ((sender.keepScore ?? 0) < existing.keepScore) {
-        existing.keepScore = sender.keepScore ?? 0;
-      }
-      if (sender.category === 'Newsletter' || existing.category === 'Newsletter') {
-        existing.category = 'Newsletter';
-      }
-      existing.hasInbox = existing.hasInbox || !!sender.hasInbox;
-    }
-    return Array.from(byDomain.values()).sort((a, b) => b.emailCount - a.emailCount);
-  }, [visibleSenders]);
+  const domainGroups = useMemo(
+    () => groupSendersByDomain(visibleSenders),
+    [visibleSenders],
+  );
 
   const allIds = visibleSenders.map((s) => s.id);
   const selectedCount = selected.size;
